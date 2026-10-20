@@ -15,20 +15,31 @@ jobs:
 
       - name: Build CameraAccess (unsigned, Developer Mode)
         run: |
+          set -o pipefail
           xcodebuild \
             -project samples/CameraAccess/CameraAccess.xcodeproj \
             -scheme CameraAccess \
-            -configuration Release \
+            -configuration Debug \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$PWD/build/DD" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build 2>&1 | tee build.log
+
+      - name: Show build errors in summary
+        if: always()
+        run: |
+          {
+            echo '## xcodebuild errors'
+            echo '```'
+            grep -E "error:|\*\* BUILD" build.log | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package unsigned IPA
         run: |
-          APP_PATH=$(find "$PWD/build/DD/Build/Products/Release-iphoneos" -maxdepth 1 -name "*.app" | head -n 1)
+          APP_PATH=$(find "$PWD/build/DD/Build/Products/Debug-iphoneos" -maxdepth 1 -name "*.app" | head -n 1)
           echo "App: $APP_PATH"
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
