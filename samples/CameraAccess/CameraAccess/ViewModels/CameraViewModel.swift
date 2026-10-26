@@ -167,6 +167,12 @@ final class CameraViewModel {
   // recording — the passthrough writer handles compressed frames directly.
   @ObservationIgnored private let videoFrameDecoder = VideoFrameDecoder()
 
+  // FPV upload to Pi: same-Wi-Fi LAN IP by default. If the Tailscale app
+  // runs on this phone, swap to http://100.93.202.74:8766/frame instead.
+  @ObservationIgnored private let piFrameURL =
+    URL(string: "http://192.168.1.75:8766/frame")!
+  @ObservationIgnored private var lastPiUpload = Date.distantPast
+
   @ObservationIgnored private var deviceMonitorTask: Task<Void, Never>?
   @ObservationIgnored private var appLifecycleTask: Task<Void, Never>?
   @ObservationIgnored private let sessionTokenBag = ListenerTokenBag()
@@ -271,6 +277,17 @@ final class CameraViewModel {
       return
     }
     beginStream(on: session)
+  }
+
+  /// Uploads one decoded frame to the Pi receiver (see piFrameURL).
+  /// Fire-and-forget: failures are ignored so streaming never stalls.
+  private func uploadFrameToPi(_ image: UIImage) {
+    guard let jpeg = image.jpegData(compressionQuality: 0.7) else { return }
+    var req = URLRequest(url: piFrameURL)
+    req.httpMethod = "POST"
+    req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jpeg
+    URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
   }
 
   /// Creates the camera `Stream` on the started session and starts it. Callers
@@ -499,6 +516,14 @@ final class CameraViewModel {
 
       // Decode the compressed hvc1 frame for preview off the main actor.
       let previewImage = self.videoFrameDecoder.decode(frame.sampleBuffer)
+
+      // Upload ~1 fps to the Pi for face recognition (fire-and-forget).
+      if let image = previewImage,
+        Date().timeIntervalSince(lastPiUpload) >= 1.0
+      {
+        lastPiUpload = Date()
+        uploadFrameToPi(image)
+      }
 
       Task { @MainActor [weak self] in
         guard let self else { return }
