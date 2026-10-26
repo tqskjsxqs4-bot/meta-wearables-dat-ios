@@ -518,11 +518,16 @@ final class CameraViewModel {
       let previewImage = self.videoFrameDecoder.decode(frame.sampleBuffer)
 
       // Upload ~1 fps to the Pi for face recognition (fire-and-forget).
-      if let image = previewImage,
-        Date().timeIntervalSince(lastPiUpload) >= 1.0
-      {
-        lastPiUpload = Date()
-        uploadFrameToPi(image)
+      // The frame publisher's closure is Sendable, so this MainActor
+      // class's state is touched via a MainActor task, the same pattern
+      // used elsewhere in this file.
+      if let image = previewImage {
+        Task { @MainActor in
+          if Date().timeIntervalSince(self.lastPiUpload) >= 1.0 {
+            self.lastPiUpload = Date()
+            self.uploadFrameToPi(image)
+          }
+        }
       }
 
       Task { @MainActor [weak self] in
