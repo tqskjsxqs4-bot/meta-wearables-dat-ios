@@ -172,6 +172,12 @@ final class CameraViewModel {
   @ObservationIgnored private let piFrameURL =
     URL(string: "http://192.168.1.75:8766/frame")!
   @ObservationIgnored private var lastPiUpload = Date.distantPast
+  // Pi face-result announcement: speak a recognized name via TTS. With the
+  // glasses as the phone's Bluetooth audio output, it plays on the glasses.
+  // Debounced in uploadFrameToPi so the same face is not announced every frame.
+  @ObservationIgnored private var lastAnnouncedName: String?
+  @ObservationIgnored private var lastAnnounceTime = Date.distantPast
+  @ObservationIgnored private let piSpeech = AVSpeechSynthesizer()
 
   @ObservationIgnored private var deviceMonitorTask: Task<Void, Never>?
   @ObservationIgnored private var appLifecycleTask: Task<Void, Never>?
@@ -287,7 +293,27 @@ final class CameraViewModel {
     req.httpMethod = "POST"
     req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
     req.httpBody = jpeg
-    URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
+    URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+      // The Pi recognizes inline and returns {"faces":[{name, match_score}]}
+      // in the POST response. Announce a recognized name (debounced);
+      // unregistered faces (name == null) are never announced.
+      guard let self, let data,
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let faces = obj["faces"] as? [[String: Any]],
+            let first = faces.first,
+            let name = first["name"] as? String else { return }
+      Task { @MainActor in
+        let now = Date()
+        if self.lastAnnouncedName != name
+            || now.timeIntervalSince(self.lastAnnounceTime) > 10 {
+          self.lastAnnouncedName = name
+          self.lastAnnounceTime = now
+          let utt = AVSpeechUtterance(string: "认出\(name)")
+          utt.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+          self.piSpeech.speak(utt)
+        }
+      }
+    }.resume()
   }
 
   /// Creates the camera `Stream` on the started session and starts it. Callers
