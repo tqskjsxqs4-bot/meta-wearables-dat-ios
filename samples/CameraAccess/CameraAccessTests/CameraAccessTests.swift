@@ -6,311 +6,632 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-@testable import CameraAccess
-import Foundation
+import AVFoundation
 import MWDATCamera
 import MWDATCore
-import MWDATMockDevice
 import Observation
 import SwiftUI
 import UIKit
-// ast-grep-ignore: swift-testing/swift/no-new-xctest
-import XCTest
 
+extension TimeInterval {
+  /// Formats a duration as `mm:ss`.
+  var formattedRecordingTime: String {
+    let minutes = Int(self) / 60
+    let seconds = Int(self) % 60
+    return String(format: "%02d:%02d", minutes, seconds)
+  }
+}
+
+/// A capture awaiting preview/share — a still photo or a recorded video file.
+/// Drives a single `.sheet(item:)` so photo and video share one presentation.
+enum CapturePreview: Identifiable {
+  case photo(UIImage)
+  case video(URL)
+
+  var id: String {
+    switch self {
+    case .photo: return "photo"
+    case .video(let url): return "video:\(url.absoluteString)"
+    }
+  }
+}
+
+/// Drives the camera screen by exercising the SDK's camera lifecycle as explicit
+/// steps: create/start a `DeviceSession`, add and start a `Stream`, capture or
+/// record, stop the stream, end the session. Owns the screen-scoped pieces —
+/// active-device monitoring, the `DeviceSession`, and its `Stream`. The UI binds to
+/// the SDK's own `DeviceSessionState` / `StreamState` so the sample shows the real
+/// state machine.
+@Observable
 @MainActor
-final class ViewModelIntegrationTests: XCTestCase {
+final class CameraViewModel {
+  // MARK: - Device
 
-  private var mockDevice: MockGlasses?
-  private var cameraKit: MockCameraKit?
-  private var viewModel: CameraViewModel?
+  /// Whether an eligible device is currently active. Drives the "Put on your
+  /// glasses" placeholder. Sourced from the auto device selector.
+  private(set) var hasActiveDevice: Bool = false
 
-  override func setUp() async throws {
-    try await super.setUp()
-    try? Wearables.configure()
+  // MARK: - Session state (bound directly to the SDK)
 
-    MockDeviceKit.shared.enable()
+  /// The device session's state, mirrored from `DeviceSession.statePublisher`.
+  /// `.idle`/`.stopped` mean no live session.
+  var sessionState: DeviceSessionState = .idle
 
-    // Pair mock device and set up camera kit
-    let pairedMockDevice = try MockDeviceKit.shared.pairGlasses(model: .rayBanMeta)
-    mockDevice = pairedMockDevice
-    cameraKit = pairedMockDevice.services.camera
+  // MARK: - Preview
 
-    // Power on and don the device to make it available for session start.
-    pairedMockDevice.powerOn()
-    pairedMockDevice.don()
+  /// The latest decoded preview frame. Read only by the isolated `LivePreviewView`
+  /// so the ~24fps updates don't re-render the whole screen.
+  var currentVideoFrame: UIImage?
+  var hasReceivedFirstFrame: Bool = false
 
-    // Wait for device to be available in Wearables
-    try await Task.sleep(nanoseconds: 1_000_000_000)
+  /// The stream's state, mirrored from `Stream.statePublisher`. `.stopped` means
+  /// no live stream.
+  var streamState: StreamState = .stopped
+
+  // MARK: - Capture preview
+
+  /// The capture currently shown in the preview/share sheet (photo or video).
+  var activePreview: CapturePreview?
+  var isCapturingPhoto: Bool = false
+
+  // MARK: - Video recording
+
+  var isRecording: Bool = false
+  /// Wall-clock start of the active recording (first written frame), mirrored from the
+  /// recorder. Drives the isolated `RecordingTimerLabel`'s `TimelineView`, so the timer
+  /// counts continuously — including through a stream pause. `nil` when not recording.
+  var recordingStartDate: Date?
+  /// Whether to record the glasses-microphone (Bluetooth HFP) audio into videos
+  /// (sound-in-video). Toggled from the mic button shown while streaming.
+  var includeAudioInStream: Bool = true
+  /// Mic denied — iOS won't re-prompt. Drives the toggle's disabled look + tap-to-Settings.
+  /// Still required for glasses audio: iOS gates HFP capture behind mic permission too.
+  var micDenied: Bool { AVAudioApplication.shared.recordPermission == .denied }
+
+  // MARK: - Errors
+
+  /// Drives the single error alert. Uses the SDK's own `localizedDescription`
+  /// rather than an app-maintained error map.
+  var showError: Bool = false
+  var errorMessage: String = ""
+
+  /// Drives the confirm prompt shown before the camera-permission redirect to the
+  /// Meta AI app — surfaced only when permission isn't already granted.
+  var showCameraPermissionRedirectConfirm: Bool = false
+
+  // MARK: - Derived session state
+
+  var isSessionStarting: Bool { sessionState == .starting }
+  var isSessionActive: Bool { sessionState == .started }
+  /// A session exists and is connected (or connecting); a stream can be started.
+  var hasSession: Bool {
+    switch sessionState {
+    case .starting, .started, .paused, .stopping: return true
+    case .idle, .stopped: return false
+    }
   }
 
-  override func tearDown() async throws {
-    viewModel?.endSession()
-    viewModel = nil
-    await MockDeviceKit.shared.disable()
-    mockDevice = nil
-    cameraKit = nil
-    try await super.tearDown()
+  /// Human-readable session state for the status line.
+  var sessionStateText: String { sessionState.description }
+
+  // MARK: - Derived stream state
+
+  var isStreaming: Bool { streamState == .streaming }
+  /// A stream is attached (in any non-terminal state).
+  var hasStream: Bool { streamState != .stopped }
+
+  /// A session or stream start/stop is in flight. The UI shows a spinner and
+  /// disables the controls until the SDK settles on a stable state, so transient
+  /// states never need their own controls or labels.
+  var isBusy: Bool {
+    isSessionStarting || sessionState == .stopping
+      || streamState == .starting || streamState == .waitingForDevice || streamState == .stopping
   }
 
-  // MARK: - Video Streaming Flow Tests
-
-  func testVideoStreamingFlow() async throws {
-    guard let camera = cameraKit else {
-      XCTFail("Mock device and camera should be available")
-      return
+  /// Human-readable stream state for the status line. `StreamState` has no
+  /// `description`, so map it here.
+  var streamStateText: String {
+    switch streamState {
+    case .streaming: return "streaming"
+    case .starting: return "starting"
+    case .waitingForDevice: return "waiting for device"
+    case .stopping: return "stopping"
+    case .stopped: return "stopped"
+    case .paused: return "paused"
     }
-
-    guard let videoURL = Bundle.main.url(forResource: "plant", withExtension: "mp4")
-    else {
-      XCTFail("Test resources not found")
-      return
-    }
-
-    // Setup camera feed
-    camera.setCameraFeed(fileURL: videoURL)
-
-    let viewModel = CameraViewModel(wearables: Wearables.shared)
-    self.viewModel = viewModel
-
-    // Wait for the mock device to be detected
-    await observeUntil(timeout: 5) { viewModel.hasActiveDevice }
-
-    // Initially nothing is running
-    XCTAssertEqual(viewModel.streamState, .stopped)
-    XCTAssertFalse(viewModel.hasSession)
-    XCTAssertFalse(viewModel.isStreaming)
-    XCTAssertFalse(viewModel.hasReceivedFirstFrame)
-    XCTAssertNil(viewModel.currentVideoFrame)
-
-    // Step 1: start a session (no stream yet)
-    viewModel.startSession()
-    await observeUntil(timeout: 5) { viewModel.isSessionActive }
-    XCTAssertTrue(viewModel.isSessionActive)
-    XCTAssertFalse(viewModel.hasStream)
-
-    // Step 2: start streaming
-    await viewModel.startStreaming()
-
-    // Wait for streaming to establish
-    await observeUntil(timeout: 10) {
-      viewModel.isStreaming && viewModel.hasReceivedFirstFrame && viewModel.currentVideoFrame != nil
-    }
-
-    // Verify streaming is active and receiving frames
-    XCTAssertTrue(viewModel.isStreaming)
-    XCTAssertTrue(viewModel.hasReceivedFirstFrame)
-    XCTAssertNotNil(viewModel.currentVideoFrame)
-
-    // Stop streaming — session stays connected
-    viewModel.stopStreaming()
-    await observeUntil(timeout: 5) { !viewModel.isStreaming && !viewModel.hasStream }
-
-    XCTAssertFalse(viewModel.isStreaming)
-    XCTAssertEqual(viewModel.streamState, .stopped)
-    XCTAssertTrue(viewModel.isSessionActive)
-
-    // End the session
-    viewModel.endSession()
-    await observeUntil(timeout: 5) { !viewModel.hasSession }
-    XCTAssertFalse(viewModel.hasSession)
   }
 
-  // MARK: - Photo Capture Flow Tests
+  /// The stream is paused (device-initiated, e.g. a single cap-touch tap). The
+  /// last frame is retained, so the preview can stay on screen frozen.
+  var isPaused: Bool { streamState == .paused }
 
-  func testStreamingAndPhotoCaptureFlow() async throws {
-    guard let camera = cameraKit else {
-      XCTFail("Mock device and camera should be available")
+  /// The preview surface (live frames, or the last held frame) should fill the
+  /// screen: while streaming, while paused (frozen on the last frame), or while
+  /// tearing down with a last frame so the stop loader overlays the preview.
+  var showsLivePreview: Bool {
+    isStreaming
+      || ((streamState == .paused || streamState == .stopping) && currentVideoFrame != nil)
+  }
+
+  // MARK: - Private
+
+  @ObservationIgnored private let wearables: WearablesInterface
+  @ObservationIgnored private let deviceSelector: AutoDeviceSelector
+  @ObservationIgnored private var deviceSession: DeviceSession?
+  @ObservationIgnored private var camera: MWDATCamera.Camera?
+  @ObservationIgnored private var isStoppingForBackground: Bool = false
+  @ObservationIgnored private var backgroundStopSuppressionTask: Task<Void, Never>?
+
+  @ObservationIgnored private let videoRecorder = VideoRecorder()
+  // Decodes compressed hvc1 frames for on-screen preview. Not required for
+  // recording — the passthrough writer handles compressed frames directly.
+  @ObservationIgnored private let videoFrameDecoder = VideoFrameDecoder()
+
+  // FPV upload to Pi: same-Wi-Fi LAN IP by default. If the Tailscale app
+  // runs on this phone, swap to http://100.93.202.74:8766/frame instead.
+  @ObservationIgnored private let piFrameURL =
+    URL(string: "http://192.168.1.75:8766/frame")!
+  @ObservationIgnored private var lastPiUpload = Date.distantPast
+  // Pi face-result announcement: speak a recognized name via TTS. With the
+  // glasses as the phone's Bluetooth audio output, it plays on the glasses.
+  // Debounced in uploadFrameToPi so the same face is not announced every frame.
+  @ObservationIgnored private var lastAnnouncedName: String?
+  @ObservationIgnored private var lastAnnounceTime = Date.distantPast
+  @ObservationIgnored private let piSpeech = AVSpeechSynthesizer()
+
+  @ObservationIgnored private var deviceMonitorTask: Task<Void, Never>?
+  @ObservationIgnored private var appLifecycleTask: Task<Void, Never>?
+  @ObservationIgnored private let sessionTokenBag = ListenerTokenBag()
+  @ObservationIgnored private let streamTokenBag = ListenerTokenBag()
+
+  @ObservationIgnored private let photoCaptureFailureMessage =
+    "Couldn't capture photo. There may not be enough storage, or another capture is in progress. Try again in a few moments."
+  @ObservationIgnored private let backgroundStopErrorSuppressionTimeout: Duration
+
+  // MARK: - Init
+
+  init(
+    wearables: WearablesInterface,
+    backgroundStopErrorSuppressionTimeout: Duration = .seconds(5)
+  ) {
+    self.wearables = wearables
+    self.deviceSelector = AutoDeviceSelector(wearables: wearables)
+    self.backgroundStopErrorSuppressionTimeout = backgroundStopErrorSuppressionTimeout
+    startDeviceMonitoring()
+    startAppLifecycleMonitoring()
+  }
+
+  isolated deinit {
+    deviceMonitorTask?.cancel()
+    appLifecycleTask?.cancel()
+    backgroundStopSuppressionTask?.cancel()
+    deviceSession?.stop()
+  }
+
+  // MARK: - Lifecycle step 1: session
+
+  /// Creates and starts a `DeviceSession` (no stream yet). This is the first
+  /// explicit step — a session can stay connected with no active stream. The
+  /// state observer drives `sessionState`; we only seed an optimistic
+  /// `.starting` so the UI reflects the in-flight request immediately.
+  func startSession() {
+    guard !hasSession else { return }
+    do throws(DeviceSessionError) {
+      let session = try wearables.createSession(deviceSelector: deviceSelector)
+      deviceSession = session
+      // Subscribe before start() so no initial state transitions are missed.
+      observeSession(session)
+      // Reflect the in-flight request immediately; the observer drives it onward.
+      sessionState = .starting
+      try session.start()
+    } catch {
+      handleSessionError(error)
+      sessionState = .idle
+      cleanupSession()
+    }
+  }
+
+  /// Stops the stream (if any) and ends the device session. `stop()` is terminal;
+  /// the SDK cascades the stop to the stream and the state observers clean up
+  /// when `.stopped` arrives.
+  func endSession() {
+    guard let session = deviceSession else { return }
+    // Reflect the in-flight stop immediately so the controls disable at once; the
+    // state observer drives it onward to `.stopped`.
+    sessionState = .stopping
+    session.stop()
+  }
+
+  // MARK: - Lifecycle step 2: stream
+
+  /// Adds a `Stream` to the started session and starts it. Requires a session in
+  /// `.started`. Camera permission is checked first (a query, no redirect); if it
+  /// isn't already granted, the actual request — which redirects to the Meta AI
+  /// app — is deferred to `confirmCameraPermissionRedirect()` so the app-switch is
+  /// confirmed, not a surprise.
+  func startStreaming() async {
+    guard let session = deviceSession, session.state == .started else {
+      showError("Start a session before previewing.")
       return
     }
+    guard camera == nil else { return }
 
-    guard let videoURL = Bundle.main.url(forResource: "plant", withExtension: "mp4"),
-      let imageURL = Bundle.main.url(forResource: "plant", withExtension: "png")
-    else {
-      XCTFail("Test resources not found")
+    do {
+      if try await wearables.checkPermissionStatus(.camera) == .granted {
+        beginStream(on: session)
+      } else {
+        showCameraPermissionRedirectConfirm = true
+      }
+    } catch {
+      showError(error.localizedDescription)
+    }
+  }
+
+  /// Confirmed from the permission prompt: requests camera access — this opens the
+  /// Meta AI app and resumes when the user returns — then starts the stream if
+  /// access was granted.
+  func confirmCameraPermissionRedirect() async {
+    showCameraPermissionRedirectConfirm = false
+    guard let session = deviceSession, session.state == .started, camera == nil else { return }
+    do {
+      guard try await wearables.requestPermission(.camera) == .granted else {
+        showError("Camera permission denied")
+        return
+      }
+    } catch {
+      showError(error.localizedDescription)
       return
     }
+    beginStream(on: session)
+  }
 
-    // Setup camera feed
-    camera.setCameraFeed(fileURL: videoURL)
-    camera.setCapturedImage(fileURL: imageURL)
+  /// Uploads one decoded frame to the Pi receiver (see piFrameURL).
+  /// Fire-and-forget: failures are ignored so streaming never stalls.
+  private func uploadFrameToPi(_ image: UIImage) {
+    guard let jpeg = image.jpegData(compressionQuality: 0.7) else { return }
+    var req = URLRequest(url: piFrameURL)
+    req.httpMethod = "POST"
+    req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jpeg
+    URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+      // The Pi recognizes inline and returns {"faces":[{name, match_score}]}
+      // in the POST response. Announce a recognized name (debounced);
+      // unregistered faces (name == null) are never announced.
+      guard let self, let data,
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let faces = obj["faces"] as? [[String: Any]],
+            let first = faces.first,
+            let name = first["name"] as? String else { return }
+      Task { @MainActor in
+        let now = Date()
+        if self.lastAnnouncedName != name
+            || now.timeIntervalSince(self.lastAnnounceTime) > 10 {
+          self.lastAnnouncedName = name
+          self.lastAnnounceTime = now
+          let utt = AVSpeechUtterance(string: "认出\(name)")
+          utt.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+          self.piSpeech.speak(utt)
+        }
+      }
+    }.resume()
+  }
 
-    let viewModel = CameraViewModel(wearables: Wearables.shared)
-    self.viewModel = viewModel
+  /// Creates the camera `Stream` on the started session and starts it. Callers
+  /// must have ensured camera permission is granted first.
+  private func beginStream(on session: DeviceSession) {
+    guard camera == nil else { return }
+    // hvc1 (compressed HEVC) so frames can be written to file in passthrough mode.
+    // Glasses-mic (Bluetooth HFP) audio for sound-in-video is captured app-side by
+    // AudioCaptureHandler, so the SDK stream needs only the public video config (no audio codec).
+    let config = StreamConfiguration(
+      videoCodec: VideoCodec.hvc1,
+      resolution: StreamingResolution.high,
+      frameRate: 24
+    )
 
-    // Wait for the mock device to be detected
-    await observeUntil(timeout: 5) { viewModel.hasActiveDevice }
-
-    // Initially nothing is running
-    XCTAssertEqual(viewModel.streamState, .stopped)
-    XCTAssertFalse(viewModel.isStreaming)
-    XCTAssertNil(viewModel.activePreview)
-
-    // Start a session, then start streaming
-    viewModel.startSession()
-    await observeUntil(timeout: 5) { viewModel.isSessionActive }
-    await viewModel.startStreaming()
-
-    // Wait for streaming to establish
-    await observeUntil(timeout: 10) {
-      viewModel.isStreaming && viewModel.hasReceivedFirstFrame && viewModel.currentVideoFrame != nil
+    do {
+      // Add the consolidated `Camera` capability and stream through `camera.stream`.
+      guard let newCamera = try session.addCamera(config: config) else {
+        showError("Couldn't create the camera. Try again.")
+        return
+      }
+      camera = newCamera
+      // Subscribe before start() so no initial state transitions are missed.
+      setupStreamListeners(for: newCamera.stream)
+      // Reflect the in-flight request immediately; the observer drives it onward.
+      streamState = .starting
+      newCamera.stream.start()
+    } catch {
+      camera = nil
+      showError(error.localizedDescription)
     }
+  }
 
-    XCTAssertTrue(viewModel.isStreaming)
-    XCTAssertTrue(viewModel.hasReceivedFirstFrame)
-    XCTAssertNotNil(viewModel.currentVideoFrame)
+  /// Stops the camera stream but keeps the `DeviceSession` connected, so
+  /// streaming can be started again without re-creating the session. The stream
+  /// `.stopped` observer performs the teardown — we don't eagerly reset here.
+  func stopStreaming() {
+    guard let activeCamera = camera else { return }
+    videoRecorder.prepareToStop()
+    // Reflect the in-flight request immediately; the observer drives it onward.
+    streamState = .stopping
+    // Stopping the camera cascades to its stream child and detaches the camera from the
+    // session, so streaming can be started again with a fresh `addCamera()`.
+    activeCamera.stop()
+  }
 
-    // Capture photo while streaming — opens the capture preview
-    viewModel.capturePhoto()
-    await observeUntil(timeout: 10) { viewModel.activePreview != nil }
+  // MARK: - Capture
 
-    // Verify a photo preview opened while the stream stayed live
-    if case .photo = viewModel.activePreview {
-      // expected
+  func capturePhoto() {
+    guard !isCapturingPhoto, isStreaming else {
+      showError(photoCaptureFailureMessage)
+      return
+    }
+    isCapturingPhoto = true
+    let success = camera?.stream.capturePhoto(format: .jpeg) ?? false
+    if !success {
+      isCapturingPhoto = false
+      showError(photoCaptureFailureMessage)
+    }
+  }
+
+  func toggleRecording() {
+    if isRecording {
+      Task { await stopVideoRecording() }
     } else {
-      XCTFail("Expected a photo capture preview")
+      startVideoRecording()
     }
-    XCTAssertTrue(viewModel.isStreaming)
-
-    // Dismiss the preview, then tear down
-    viewModel.dismissCapturePreview()
-    XCTAssertNil(viewModel.activePreview)
-
-    viewModel.endSession()
-    await observeUntil(timeout: 5) { !viewModel.isStreaming && !viewModel.hasSession }
-
-    XCTAssertFalse(viewModel.isStreaming)
-    XCTAssertFalse(viewModel.hasSession)
   }
 
-  // MARK: - Pause/Resume Flow Tests
-
-  func testStreamPausedViaSingleTapKeepsPreviewVisible() async throws {
-    guard let camera = cameraKit, let device = mockDevice else {
-      XCTFail("Mock device and camera should be available")
-      return
+  func startVideoRecording() {
+    guard isStreaming, !isRecording else { return }
+    // Flip the intent flag synchronously so the toggle and UI don't lag the
+    // frame-driven recorder; the file starts on the next frame.
+    isRecording = true
+    // If the glasses mic isn't available, flip the mic off so the button reflects that this
+    // recording is video-only (the phone mic is never used). Left off afterward — the user can
+    // re-tap the mic to turn it back on.
+    videoRecorder.prepareToStart(includeAudio: includeAudioInStream) { [weak self] in
+      Task { @MainActor in self?.includeAudioInStream = false }
     }
-
-    guard let videoURL = Bundle.main.url(forResource: "plant", withExtension: "mp4") else {
-      XCTFail("Test resources not found")
-      return
-    }
-
-    camera.setCameraFeed(fileURL: videoURL)
-
-    let viewModel = CameraViewModel(wearables: Wearables.shared)
-    self.viewModel = viewModel
-
-    await observeUntil(timeout: 5) { viewModel.hasActiveDevice }
-    viewModel.startSession()
-    await observeUntil(timeout: 5) { viewModel.isSessionActive }
-    await viewModel.startStreaming()
-    await observeUntil(timeout: 10) {
-      viewModel.isStreaming && viewModel.hasReceivedFirstFrame && viewModel.currentVideoFrame != nil
-    }
-
-    // Single tap on the touchpad pauses the stream.
-    device.services.captouch.tap()
-    await observeUntil(timeout: 5) { viewModel.streamState == .paused }
-
-    // Regression: paused must keep the last frame visible (the bug hid it).
-    XCTAssertTrue(viewModel.isPaused)
-    XCTAssertNotNil(viewModel.currentVideoFrame, "Last frame should be retained while paused")
-    XCTAssertTrue(viewModel.showsLivePreview, "Preview should remain visible when paused")
-
-    // Single tap again → resumes streaming, preview still visible.
-    device.services.captouch.tap()
-    await observeUntil(timeout: 5) { viewModel.isStreaming }
-    XCTAssertFalse(viewModel.isPaused, "Second tap should exit the paused state")
-    XCTAssertTrue(viewModel.showsLivePreview)
-
-    viewModel.endSession()
-    await observeUntil(timeout: 5) { !viewModel.hasSession }
-    XCTAssertFalse(viewModel.hasSession)
   }
 
-  func testBackgroundingActiveStreamStopsSessionWithoutShowingError() async throws {
-    guard let camera = cameraKit else {
-      XCTFail("Mock device and camera should be available")
-      return
+  func stopVideoRecording() async {
+    guard isRecording else { return }
+    isRecording = false
+    recordingStartDate = nil
+    // The writer starts on the first frame after the shutter opens. If stop lands
+    // before that frame arrives, wait briefly (shutter still open) so even a quick
+    // recording finalizes to a file and reliably opens the preview.
+    var elapsedNanos: UInt64 = 0
+    while !videoRecorder.isRecording, elapsedNanos < 500_000_000 {
+      try? await Task.sleep(nanoseconds: 25_000_000)
+      elapsedNanos += 25_000_000
     }
-
-    guard let videoURL = Bundle.main.url(forResource: "plant", withExtension: "mp4") else {
-      XCTFail("Test resources not found")
-      return
+    // Show a preview/share sheet (mirrors the photo flow) for the finalized file.
+    switch await videoRecorder.stopRecording() {
+    case .completed(let url):
+      activePreview = .video(url)
+    case .noRecording:
+      // Reached only after the intent guard + start wait, so while streaming this
+      // means the recording never started (e.g. the writer failed to start).
+      showError("Couldn't start recording. Try again.")
+    case .failed:
+      showError("Recording couldn't be saved. Try again.")
     }
-
-    camera.setCameraFeed(fileURL: videoURL)
-
-    let viewModel = CameraViewModel(wearables: Wearables.shared)
-    self.viewModel = viewModel
-
-    await observeUntil(timeout: 5) { viewModel.hasActiveDevice }
-    viewModel.startSession()
-    await observeUntil(timeout: 5) { viewModel.isSessionActive }
-    await viewModel.startStreaming()
-    await observeUntil(timeout: 10) {
-      viewModel.isStreaming && viewModel.hasReceivedFirstFrame && viewModel.currentVideoFrame != nil
-    }
-
-    NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
-
-    await observeUntil(timeout: 5) { !viewModel.hasSession }
-    XCTAssertFalse(viewModel.hasSession)
-    XCTAssertEqual(viewModel.sessionState, .stopped)
-    XCTAssertEqual(viewModel.streamState, .stopped)
-    XCTAssertFalse(viewModel.showError)
   }
-}
 
-// MARK: - Test Helpers
+  // MARK: - Dismissers
 
-/// Thread-safe one-shot flag for protecting continuation resumption.
-private final class ResumeOnce: @unchecked Sendable {
-  private let lock = NSLock()
-  private var resumed = false
-  func tryResume() -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    guard !resumed else { return false }
-    resumed = true
-    return true
+  func dismissError() {
+    showError = false
   }
-}
 
-/// Reactively waits for a condition on @Observable objects to become true.
-/// Uses `withObservationTracking` to wake up immediately on property changes
-/// instead of polling on a fixed interval.
-@MainActor
-private func observeUntil(
-  timeout: TimeInterval,
-  file: StaticString = #filePath,
-  line: UInt = #line,
-  condition: @escaping () -> Bool
-) async {
-  guard !condition() else { return }
+  func dismissCapturePreview() {
+    guard let preview = activePreview else { return }
+    activePreview = nil
+    discardPreview(preview)
+  }
 
-  let deadline = ContinuousClock.now + .seconds(timeout)
-
-  while !condition() {
-    guard ContinuousClock.now < deadline else {
-      XCTFail("Condition not met within \(timeout) seconds", file: file, line: line)
-      return
+  /// Deletes a finished video capture's temporary file. Photos are held in
+  /// memory, so there's nothing on disk to remove for them.
+  func discardPreview(_ preview: CapturePreview) {
+    if case .video(let url) = preview {
+      try? FileManager.default.removeItem(at: url)
     }
+  }
 
-    await withUnsafeContinuation { cont in
-      let once = ResumeOnce()
+  // MARK: - Device monitoring
 
-      withObservationTracking {
-        _ = condition()
-      } onChange: {
-        if once.tryResume() { cont.resume() }
-      }
-
-      // Periodic fallback so we can re-evaluate the deadline
-      Task {
-        try? await Task.sleep(for: .milliseconds(100))
-        if once.tryResume() { cont.resume() }
+  /// Monitors device availability only — does NOT create sessions. Session
+  /// creation is deferred to `startSession()` to avoid races.
+  private func startDeviceMonitoring() {
+    deviceMonitorTask = Task { [weak self] in
+      guard let self else { return }
+      for await deviceId in deviceSelector.activeDeviceStream() {
+        hasActiveDevice = deviceId != nil
       }
     }
+  }
+
+  private func startAppLifecycleMonitoring() {
+    appLifecycleTask = Task { [weak self] in
+      guard let self else { return }
+      for await _ in NotificationCenter.default.notifications(named: UIApplication.didEnterBackgroundNotification) {
+        self.handleDidEnterBackground()
+      }
+    }
+  }
+
+  private func handleDidEnterBackground() {
+    guard hasSession, hasStream, sessionState != .stopping else { return }
+
+    beginBackgroundStopErrorSuppression()
+    endSession()
+  }
+
+  private func beginBackgroundStopErrorSuppression() {
+    isStoppingForBackground = true
+    backgroundStopSuppressionTask?.cancel()
+    let timeout = backgroundStopErrorSuppressionTimeout
+    backgroundStopSuppressionTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: timeout)
+      guard let self, !Task.isCancelled else { return }
+      // Bound the suppression window so a stalled teardown cannot hide
+      // unrelated later errors indefinitely.
+      self.isStoppingForBackground = false
+      self.backgroundStopSuppressionTask = nil
+    }
+  }
+
+  private func endBackgroundStopErrorSuppression() {
+    backgroundStopSuppressionTask?.cancel()
+    backgroundStopSuppressionTask = nil
+    isStoppingForBackground = false
+  }
+
+  // MARK: - Session observation
+
+  private func observeSession(_ session: DeviceSession) {
+    session.statePublisher.listen { [weak self] state in
+      Task { @MainActor in self?.handleSessionStateChange(state) }
+    }.store(in: sessionTokenBag)
+    session.errorPublisher.listen { [weak self] error in
+      Task { @MainActor in self?.handleSessionError(error) }
+    }.store(in: sessionTokenBag)
+  }
+
+  private func handleSessionStateChange(_ state: DeviceSessionState) {
+    sessionState = state
+    if state == .stopped {
+      endBackgroundStopErrorSuppression()
+      cleanupSession()
+    }
+  }
+
+  private func handleSessionError(_ error: DeviceSessionError) {
+    // Backgrounding the app intentionally ends the preview session; the SDK can
+    // still emit teardown errors while that stop converges, and surfacing those
+    // would show a false "something went wrong" alert on return.
+    guard !isStoppingForBackground else { return }
+    // All session errors surface through the single alert, including
+    // `datAppOnTheGlassesUpdateRequired`, which the SDK delivers as a one-shot event.
+    showError(error.localizedDescription)
+  }
+
+  /// Terminal session cleanup — drop the reference and observers so the next
+  /// `startSession()` creates a fresh session.
+  private func cleanupSession() {
+    sessionTokenBag.clear()
+    deviceSession = nil
+  }
+
+  // MARK: - Stream observation
+
+  private func setupStreamListeners(for stream: MWDATCamera.Stream) {
+    stream.statePublisher.listen { [weak self] state in
+      Task { @MainActor in self?.handleStreamStateChange(state) }
+    }.store(in: streamTokenBag)
+
+    stream.videoFramePublisher.listen { [weak self] frame in
+      guard let self else { return }
+
+      // Append to the recorder (no-op unless recording) off the main actor so it
+      // keeps writing while the app is backgrounded.
+      self.appendVideoFrame(frame)
+
+      // Decode the compressed hvc1 frame for preview off the main actor.
+      let previewImage = self.videoFrameDecoder.decode(frame.sampleBuffer)
+
+      // Upload ~1 fps to the Pi for face recognition (fire-and-forget).
+      // The frame publisher's closure is Sendable, so this MainActor
+      // class's state is touched via a MainActor task, the same pattern
+      // used elsewhere in this file.
+      if let image = previewImage {
+        Task { @MainActor in
+          if Date().timeIntervalSince(self.lastPiUpload) >= 1.0 {
+            self.lastPiUpload = Date()
+            self.uploadFrameToPi(image)
+          }
+        }
+      }
+
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        // Keep the live surface stable while a capture preview is onscreen.
+        if UIApplication.shared.applicationState != .background,
+          activePreview == nil,
+          !isCapturingPhoto,
+          let image = previewImage
+        {
+          self.currentVideoFrame = image
+          if !self.hasReceivedFirstFrame {
+            self.hasReceivedFirstFrame = true
+          }
+        }
+        // Capture the actual recording start (first written frame) once, so the timer
+        // anchors to the clip's start and matches its duration.
+        if self.isRecording, self.recordingStartDate == nil {
+          self.recordingStartDate = self.videoRecorder.recordingStartDate
+        }
+      }
+    }.store(in: streamTokenBag)
+
+    stream.errorPublisher.listen { [weak self] error in
+      Task { @MainActor in self?.handleStreamError(error) }
+    }.store(in: streamTokenBag)
+
+    stream.photoDataPublisher.listen { [weak self] data in
+      Task { @MainActor in self?.handlePhotoData(data) }
+    }.store(in: streamTokenBag)
+  }
+
+  private func handleStreamStateChange(_ state: StreamState) {
+    streamState = state
+    if state == .stopped {
+      // Terminal — finalize any recording, then converge teardown. Covers both
+      // user-initiated stop and SDK auto-stop (disconnect, error, session end).
+      Task { await stopVideoRecording() }
+      clearStreamResources()
+    }
+  }
+
+  /// Single stream-teardown convergence point.
+  private func clearStreamResources() {
+    streamTokenBag.clear()
+    // Detach the camera (idempotent) so a subsequent addCamera() can register a new one. On the
+    // user-stop and session-end paths the camera is already stopped, so this is a no-op; it is
+    // load-bearing only when the stream terminates on its own (a stream-level error while the
+    // session stays connected), since teardown cascades parent->child but not child->parent.
+    camera?.stop()
+    camera = nil
+    streamState = .stopped
+    currentVideoFrame = nil
+    hasReceivedFirstFrame = false
+  }
+
+  /// Appends a frame to the recorder. `nonisolated` so it keeps writing while the
+  /// app is backgrounded (the recorder is thread-safe).
+  nonisolated private func appendVideoFrame(_ frame: VideoFrame) {
+    videoRecorder.appendVideoFrame(frame.sampleBuffer)
+  }
+
+  private func handleStreamError(_ error: StreamError) {
+    // Same bounded suppression window as `handleSessionError`: hide only the
+    // expected teardown noise from an intentional background-driven stop.
+    guard !isStoppingForBackground else { return }
+    showError(error.localizedDescription)
+  }
+
+  private func handlePhotoData(_ data: PhotoData) {
+    isCapturingPhoto = false
+    if let image = UIImage(data: data.data) {
+      activePreview = .photo(image)
+    }
+  }
+
+  private func showError(_ message: String) {
+    errorMessage = message
+    showError = true
   }
 }
