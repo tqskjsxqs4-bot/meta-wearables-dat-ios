@@ -171,6 +171,11 @@ final class CameraViewModel {
   // runs on this phone, swap to http://100.93.202.74:8766/frame instead.
   @ObservationIgnored private let piFrameURL =
     URL(string: "http://192.168.1.75:8766/frame")!
+  // Second FPV copy for the Yahboom arm device: a view-only receiver on
+  // the same LAN (no recognition there). Used during grasping sessions
+  // so the arm operator can see the first-person view.
+  @ObservationIgnored private let armFrameURL =
+    URL(string: "http://192.168.1.97:8766/frame")!
   @ObservationIgnored private var lastPiUpload = Date.distantPast
   // Pi face-result announcement: speak a recognized name via TTS. With the
   // glasses as the phone's Bluetooth audio output, it plays on the glasses.
@@ -285,10 +290,18 @@ final class CameraViewModel {
     beginStream(on: session)
   }
 
-  /// Uploads one decoded frame to the Pi receiver (see piFrameURL).
+  /// Uploads one decoded frame to the Pi receiver (see piFrameURL) and a
+  /// second copy to the Yahboom arm's FPV receiver (see armFrameURL).
   /// Fire-and-forget: failures are ignored so streaming never stalls.
   private func uploadFrameToPi(_ image: UIImage) {
     guard let jpeg = image.jpegData(compressionQuality: 0.7) else { return }
+    // Arm copy first: pure fire-and-forget, response ignored, so it can
+    // never trigger or block the face announcement from the Pi below.
+    var armReq = URLRequest(url: armFrameURL)
+    armReq.httpMethod = "POST"
+    armReq.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+    armReq.httpBody = jpeg
+    URLSession.shared.dataTask(with: armReq) { _, _, _ in }.resume()
     var req = URLRequest(url: piFrameURL)
     req.httpMethod = "POST"
     req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
