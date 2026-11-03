@@ -911,15 +911,16 @@ final class ArmCommandClient {
 
   private func handleHeard(text: String?, isFinal: Bool, errorText: String?) {
     if let errorText {
-      appendLog("识别出错：\(errorText)")
       switch listenMode {
       case .move:
         if case .listening = phase {
+          appendLog("识别出错：\(errorText)")
           stopListeningPipeline()
           phase = .failed("识别出错，请再试一次")
         }
       case .confirm:
         if case .confirming = phase {
+          appendLog("识别出错：\(errorText)")
           finishCancel(reason: "没听清，已取消")
         }
       }
@@ -932,6 +933,10 @@ final class ArmCommandClient {
       guard case .listening = phase, let move = Self.matchMove(in: text) else { return }
       appendLog("听到步名：\(text)")
       stopListeningPipeline()
+      // Leave .listening first: selectMove's !isBusy guard is written
+      // for UI entry points and would silently drop this internal
+      // transition (the v8 field bug - matches logged, never selected).
+      phase = .idle
       selectMove(move)
     case .confirm:
       guard case .confirming = phase else { return }
