@@ -1138,12 +1138,12 @@ final class SpeechDiagClient {
       Task { @MainActor in
         guard let self else { return }
         if let text {
-          transcriptText = text
+          self.transcriptText = text
         }
         if let errorText {
-          taskText = "任务出错：\(errorText)"
+          self.taskText = "任务出错：\(errorText)"
         } else if isFinal {
-          taskText = "任务结束（final）"
+          self.taskText = "任务结束（final）"
         }
       }
     }
