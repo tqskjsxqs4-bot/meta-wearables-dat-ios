@@ -614,23 +614,43 @@ struct UpdateRequiredMessage: View {
 
 // MARK: - Arm commands (yahboom executor)
 //
-// Control panel for the chess arm. Pick a move (tap a move button, or type /
-// dictate its name with the system keyboard), the app reads it back, and only
-// after an explicit on-screen confirmation POSTs {move, confirmed: true} to
-// the executor service on the yahboom (port 8767). The executor enforces its
-// own whitelist and its on-device dry-run / live mode; this app never talks
-// to the arm's joint service directly.
+// Control panel for the chess arm. Input paths: tap a move button, type /
+// dictate its name with the system keyboard, or speak it (voice button).
+// The app reads the chosen move back aloud, and only after an explicit
+// confirmation - tapping the confirm button or saying the confirm word
+// once the read-back has finished - POSTs {move, confirmed: true} to the
+// executor service on the yahboom (port 8767). The executor enforces its
+// own whitelist and its on-device dry-run / live mode; this app never
+// talks to the arm's joint service directly.
 //
-// v3: in-app speech recognition was removed after a SIGTRAP crash on first
-// use (v1/v2): the crash hit instantly on tapping "start listening", before
-// any permission prompt, and the crash log carried no app-level backtrace.
-// Input is therefore tap + system keyboard dictation for now (dictation is
-// handled by iOS itself and needs no app speech permission). Read-back TTS
-// stays - AVSpeechSynthesizer is already proven in this app. A step marker
-// is kept in UserDefaults so any future crash leaves a visible trace.
+// Voice recognition history: v1 crashed instantly on "start listening".
+// The 2026-11-03 diagnostic page isolated three separate traps, all now
+// fixed in this build:
+//  1. Callbacks formed inside a @MainActor class inherit its isolation;
+//     frameworks reply on background queues and the Swift executor check
+//     traps on entry (speech authorization, recognition results, and the
+//     audio tap block). Every framework callback below is therefore
+//     created inside a nonisolated static helper.
+//  2. -[AVAudioEngine prepare] throws an uncaught NSException on an
+//     empty graph; it is never called here - start() initializes.
+//  3. Confirmation listening opens only after the read-back utterance
+//     finishes (synthesizer delegate), so the app cannot hear itself.
+// The glasses microphone is used when present: before listening, the
+// Bluetooth HFP input is preferred explicitly; otherwise the phone mic.
 
 private let armExecutorURL = URL(string: "http://192.168.1.97:8767/command")!
 private let armStepMarkerKey = "armCmdLastStep"
+
+// Synthesizer delegate lives in a nonisolated object; its finish handler
+// is an explicitly @Sendable closure, following the pattern the
+// diagnostic page proved safe for framework callbacks.
+private final class ArmSpeechDelegate: NSObject, AVSpeechSynthesizerDelegate {
+  var onFinish: (@Sendable () -> Void)?
+
+  func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+    onFinish?()
+  }
+}
 
 @MainActor
 @Observable
@@ -657,6 +677,7 @@ final class ArmCommandClient {
 
   enum Phase: Equatable {
     case idle
+    case listening
     case confirming(Move)
     case sending(Move)
     case done(String)
@@ -665,6 +686,8 @@ final class ArmCommandClient {
 
   private(set) var phase: Phase = .idle
   private(set) var logLines: [String] = []
+  private(set) var heardText: String = ""
+  private(set) var inputSource: String = ""
 
   var pendingMove: Move? {
     if case .confirming(let move) = phase { return move }
@@ -672,14 +695,15 @@ final class ArmCommandClient {
   }
   var isBusy: Bool {
     switch phase {
-    case .confirming, .sending: return true
+    case .listening, .confirming, .sending: return true
     default: return false
     }
   }
   var statusText: String {
     switch phase {
-    case .idle: return "点一步，或用键盘听写输入步名"
-    case .confirming(let move): return "已选「\(move.label)」，确认后发送"
+    case .idle: return "点一步、打字，或按语音口令说步名"
+    case .listening: return "正在听…请说步名（如：炮八平五）"
+    case .confirming(let move): return "已选「\(move.label)」，说「确认」或点确认发送"
     case .sending(let move): return "正在发送「\(move.label)」…"
     case .done(let text): return text
     case .failed(let text): return "出错：\(text)"
@@ -687,29 +711,47 @@ final class ArmCommandClient {
   }
 
   @ObservationIgnored private let synthesizer = AVSpeechSynthesizer()
+  @ObservationIgnored private let speechDelegate = ArmSpeechDelegate()
   @ObservationIgnored private var confirmTimer: Task<Void, Never>?
+  @ObservationIgnored private var confirmListenTask: Task<Void, Never>?
+  @ObservationIgnored private var listenTimeout: Task<Void, Never>?
+
+  @ObservationIgnored private var audioEngine: AVAudioEngine?
+  @ObservationIgnored private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+  @ObservationIgnored private var recognitionTask: SFSpeechRecognitionTask?
+  @ObservationIgnored private var tapInstalled = false
+  @ObservationIgnored private var listenMode: ListenMode = .move
+
+  private enum ListenMode {
+    case move
+    case confirm
+  }
+
+  init() {
+    synthesizer.delegate = speechDelegate
+  }
 
   private func mark(_ step: String) {
     UserDefaults.standard.set(step, forKey: armStepMarkerKey)
   }
 
-  // MARK: Controls used by the view
+  // MARK: Selection (tap / typed / spoken all land here)
 
   func selectMove(_ move: Move) {
     guard !isBusy else { return }
     mark("选中步法 \(move.key)")
     phase = .confirming(move)
     appendLog("选中：\(move.label)（\(move.key)），待确认")
-    speak("你要走\(move.label)，请点确认发送")
     startConfirmTimer()
+    speakThen("你要走\(move.label)。说确认发送，或点确认。") { [weak self] in
+      self?.beginConfirmListening()
+    }
   }
 
   func submitText(_ raw: String) {
     let text = raw.replacingOccurrences(of: " ", with: "")
     guard !text.isEmpty, !isBusy else { return }
-    if let move = Self.moves.first(where: { move in
-      move.phrases.contains(where: { text.contains($0) })
-    }) {
+    if let move = Self.matchMove(in: text) {
       selectMove(move)
     } else {
       phase = .failed("没匹配到步名：\(text)")
@@ -720,7 +762,8 @@ final class ArmCommandClient {
 
   func confirmSend() {
     guard case .confirming(let move) = phase else { return }
-    mark("点确认发送")
+    mark("确认发送")
+    stopListeningPipeline()
     beginSend(move)
   }
 
@@ -731,9 +774,256 @@ final class ArmCommandClient {
 
   func stopAll() {
     confirmTimer?.cancel()
+    confirmListenTask?.cancel()
+    speechDelegate.onFinish = nil
     synthesizer.stopSpeaking(at: .immediate)
-    if pendingMove != nil {
+    stopListeningPipeline()
+    switch phase {
+    case .listening, .confirming:
       phase = .idle
+    default:
+      break
+    }
+  }
+
+  // MARK: Voice input
+
+  func startVoiceInput() {
+    guard !isBusy else { return }
+    mark("语音口令-开始")
+    phase = .listening
+    heardText = ""
+    Task { @MainActor in
+      guard await self.ensureVoicePermissions() else { return }
+      guard case .listening = self.phase else { return }
+      self.beginListening(mode: .move)
+    }
+  }
+
+  func cancelVoiceInput() {
+    guard case .listening = phase else { return }
+    stopListeningPipeline()
+    phase = .idle
+    appendLog("语音口令已停止")
+  }
+
+  private func ensureVoicePermissions() async -> Bool {
+    let auth = await Self.requestSpeechAuthorizationAsync()
+    guard auth == .authorized else {
+      phase = .failed("语音识别未授权")
+      appendLog("语音识别未授权（状态 \(auth.rawValue)）")
+      return false
+    }
+    let mic = await Self.requestRecordPermissionAsync()
+    guard mic else {
+      phase = .failed("麦克风未授权")
+      appendLog("麦克风未授权")
+      return false
+    }
+    return true
+  }
+
+  private func beginConfirmListening() {
+    guard case .confirming = phase else { return }
+    confirmListenTask?.cancel()
+    confirmListenTask = Task { @MainActor in
+      // Small settle delay so the read-back's tail cannot self-confirm.
+      try? await Task.sleep(for: .milliseconds(600))
+      guard !Task.isCancelled, case .confirming = self.phase else { return }
+      guard await self.ensureVoicePermissions() else { return }
+      guard case .confirming = self.phase else { return }
+      self.beginListening(mode: .confirm)
+    }
+  }
+
+  private func beginListening(mode: ListenMode) {
+    listenMode = mode
+    mark(mode == .move ? "聆听步名" : "聆听确认")
+    do {
+      let session = AVAudioSession.sharedInstance()
+      try session.setCategory(
+        .playAndRecord, mode: .measurement,
+        options: [.duckOthers, .allowBluetoothHFP, .defaultToSpeaker])
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
+      if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+        try? session.setPreferredInput(hfp)
+      }
+      inputSource = session.currentRoute.inputs.first?.portType == .bluetoothHFP
+        ? "眼镜麦克风" : "手机麦克风"
+    } catch {
+      failVoice("音频会话失败：\(error.localizedDescription)")
+      return
+    }
+    guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")),
+          recognizer.isAvailable
+    else {
+      failVoice("中文识别器不可用")
+      return
+    }
+    if audioEngine == nil {
+      audioEngine = AVAudioEngine()
+    }
+    guard let engine = audioEngine else { return }
+    let format = engine.inputNode.outputFormat(forBus: 0)
+    guard format.sampleRate > 0, format.channelCount > 0 else {
+      failVoice("麦克风格式无效")
+      return
+    }
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+    request.contextualStrings = Self.moves.flatMap(\.phrases) + ["确认", "取消"]
+    recognitionRequest = request
+    if !tapInstalled {
+      Self.installBufferTap(engine: engine, format: format, request: request)
+      tapInstalled = true
+    }
+    do {
+      try engine.start()
+    } catch {
+      failVoice("音频引擎启动失败：\(error.localizedDescription)")
+      return
+    }
+    recognitionTask = Self.startRecognitionTask(recognizer: recognizer, request: request) {
+      [weak self] text, isFinal, errorText in
+      Task { @MainActor in
+        self?.handleHeard(text: text, isFinal: isFinal, errorText: errorText)
+      }
+    }
+    appendLog("开始聆听（\(inputSource)）：\(mode == .move ? "说步名" : "说确认或取消")")
+    listenTimeout?.cancel()
+    let seconds: Double = mode == .move ? 30 : 15
+    listenTimeout = Task { @MainActor in
+      try? await Task.sleep(for: .seconds(seconds))
+      guard !Task.isCancelled else { return }
+      switch self.listenMode {
+      case .move:
+        if case .listening = self.phase {
+          self.stopListeningPipeline()
+          self.phase = .failed("没听到步名，请再试一次")
+        }
+      case .confirm:
+        if case .confirming = self.phase {
+          self.finishCancel(reason: "确认超时，已取消")
+        }
+      }
+    }
+  }
+
+  private func handleHeard(text: String?, isFinal: Bool, errorText: String?) {
+    if let errorText {
+      appendLog("识别出错：\(errorText)")
+      switch listenMode {
+      case .move:
+        if case .listening = phase {
+          stopListeningPipeline()
+          phase = .failed("识别出错，请再试一次")
+        }
+      case .confirm:
+        if case .confirming = phase {
+          finishCancel(reason: "没听清，已取消")
+        }
+      }
+      return
+    }
+    guard let text else { return }
+    heardText = text
+    switch listenMode {
+    case .move:
+      guard case .listening = phase, let move = Self.matchMove(in: text) else { return }
+      appendLog("听到步名：\(text)")
+      stopListeningPipeline()
+      selectMove(move)
+    case .confirm:
+      guard case .confirming = phase else { return }
+      if text.contains("取消") {
+        finishCancel(reason: "已取消")
+      } else if text.contains("确认") {
+        appendLog("听到确认")
+        confirmSend()
+      }
+    }
+  }
+
+  private func failVoice(_ message: String) {
+    stopListeningPipeline()
+    if case .listening = phase {
+      phase = .failed(message)
+    }
+    appendLog(message)
+    mark("语音失败 \(message)")
+  }
+
+  private func stopListeningPipeline() {
+    listenTimeout?.cancel()
+    recognitionTask?.cancel()
+    recognitionTask = nil
+    recognitionRequest?.endAudio()
+    recognitionRequest = nil
+    if let engine = audioEngine {
+      if engine.isRunning {
+        engine.stop()
+      }
+      if tapInstalled {
+        engine.inputNode.removeTap(onBus: 0)
+        tapInstalled = false
+      }
+    }
+    try? AVAudioSession.sharedInstance().setActive(
+      false, options: .notifyOthersOnDeactivation)
+  }
+
+  // MARK: Framework callbacks - all created in nonisolated helpers
+  //
+  // A closure formed inside this @MainActor class inherits its
+  // isolation; the TCC service, the Speech daemon and the audio
+  // real-time thread all call back on other queues, and the executor
+  // check traps on entry (three crashes on 2026-11-03). Forming the
+  // closures inside these nonisolated statics avoids the check.
+
+  nonisolated private static func requestSpeechAuthorizationAsync()
+    async -> SFSpeechRecognizerAuthorizationStatus
+  {
+    await withCheckedContinuation { continuation in
+      SFSpeechRecognizer.requestAuthorization { status in
+        continuation.resume(returning: status)
+      }
+    }
+  }
+
+  nonisolated private static func requestRecordPermissionAsync() async -> Bool {
+    await withCheckedContinuation { continuation in
+      AVAudioApplication.requestRecordPermission { granted in
+        continuation.resume(returning: granted)
+      }
+    }
+  }
+
+  nonisolated private static func installBufferTap(
+    engine: AVAudioEngine, format: AVAudioFormat,
+    request: SFSpeechAudioBufferRecognitionRequest
+  ) {
+    engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+      request.append(buffer)
+    }
+  }
+
+  nonisolated private static func startRecognitionTask(
+    recognizer: SFSpeechRecognizer,
+    request: SFSpeechAudioBufferRecognitionRequest,
+    onEvent: @escaping @Sendable (_ text: String?, _ isFinal: Bool, _ errorText: String?) -> Void
+  ) -> SFSpeechRecognitionTask {
+    recognizer.recognitionTask(with: request) { result, error in
+      onEvent(
+        result?.bestTranscription.formattedString,
+        result?.isFinal ?? false,
+        error?.localizedDescription)
+    }
+  }
+
+  private static func matchMove(in text: String) -> Move? {
+    let clean = text.replacingOccurrences(of: " ", with: "")
+    return moves.first { move in
+      move.phrases.contains { clean.contains($0) }
     }
   }
 
@@ -742,7 +1032,7 @@ final class ArmCommandClient {
   private func startConfirmTimer() {
     confirmTimer?.cancel()
     confirmTimer = Task { @MainActor in
-      try? await Task.sleep(for: .seconds(15))
+      try? await Task.sleep(for: .seconds(25))
       guard !Task.isCancelled, case .confirming = self.phase else { return }
       self.finishCancel(reason: "确认超时，已取消")
     }
@@ -750,6 +1040,9 @@ final class ArmCommandClient {
 
   private func finishCancel(reason: String) {
     confirmTimer?.cancel()
+    confirmListenTask?.cancel()
+    speechDelegate.onFinish = nil
+    stopListeningPipeline()
     phase = .idle
     appendLog(reason)
     speak(reason)
@@ -802,6 +1095,20 @@ final class ArmCommandClient {
   // MARK: Speech out + log
 
   private func speak(_ text: String) {
+    speechDelegate.onFinish = nil
+    let utterance = AVSpeechUtterance(string: text)
+    utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+    synthesizer.stopSpeaking(at: .immediate)
+    synthesizer.speak(utterance)
+  }
+
+  // Speak, and when the utterance has fully finished, run the follow-up
+  // (used to open confirmation listening only after the read-back ends,
+  // so the app never hears its own prompt).
+  private func speakThen(_ text: String, then: @escaping @MainActor () -> Void) {
+    speechDelegate.onFinish = {
+      Task { @MainActor in then() }
+    }
     let utterance = AVSpeechUtterance(string: text)
     utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
     synthesizer.stopSpeaking(at: .immediate)
@@ -832,9 +1139,42 @@ struct ArmCommandView: View {
             .background(Color.secondary.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 12))
 
+          if case .listening = client.phase {
+            Button(role: .destructive) {
+              client.cancelVoiceInput()
+            } label: {
+              Text("正在听…点这里停止")
+                .font(.system(size: 17, weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.borderedProminent)
+          } else {
+            Button {
+              client.startVoiceInput()
+            } label: {
+              Text("🎤 语音口令：点这里说步名")
+                .font(.system(size: 17, weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(client.isBusy)
+          }
+
+          if !client.inputSource.isEmpty {
+            Text("麦克风：\(client.inputSource)")
+              .font(.system(size: 13))
+              .foregroundStyle(.secondary)
+          }
+          if !client.heardText.isEmpty {
+            Text("听到：\(client.heardText)")
+              .font(.system(size: 15, weight: .medium))
+          }
+
           if let pending = client.pendingMove {
             VStack(spacing: 10) {
-              Text("确认发送「\(pending.label)」？")
+              Text("确认发送「\(pending.label)」？可说「确认」，或点下面按钮")
                 .font(.system(size: 17, weight: .semibold))
               HStack(spacing: 12) {
                 Button {
@@ -950,7 +1290,6 @@ struct ArmCommandView: View {
     }
   }
 }
-
 
 // MARK: - Speech recognition diagnostics
 //
