@@ -898,6 +898,22 @@ struct ArmCommandView: View {
             }
           }
 
+          NavigationLink {
+            SpeechDiagView()
+          } label: {
+            HStack {
+              Text("语音识别诊断")
+                .font(.system(size: 16, weight: .medium))
+              Spacer()
+              Image(systemName: "chevron.right").foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity)
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+          }
+
           if !client.logLines.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
               Text("记录").font(.headline)
@@ -931,6 +947,269 @@ struct ArmCommandView: View {
       .onDisappear {
         client.stopAll()
       }
+    }
+  }
+}
+
+
+// MARK: - Speech recognition diagnostics
+//
+// Step-by-step isolation page for the v1 crash: the original flow chained
+// authorization -> session -> engine -> tap -> recognition task in one go
+// and trapped instantly. Here each stage is a separate button, executed only
+// when tapped, with a durable on-disk marker written BEFORE the stage runs -
+// so if a stage kills the app, reopening this page shows exactly where it
+// died ("上次标记"). Stage results (statuses, formats, errors) stay visible
+// on the page for reporting.
+
+@MainActor
+@Observable
+final class SpeechDiagClient {
+  private(set) var lastMarker: String = "（无）"
+  private(set) var authText: String = "未执行"
+  private(set) var micText: String = "未执行"
+  private(set) var sessionText: String = "未执行"
+  private(set) var formatText: String = "未执行"
+  private(set) var engineText: String = "未执行"
+  private(set) var taskText: String = "未执行"
+  private(set) var transcriptText: String = ""
+
+  @ObservationIgnored private var engine: AVAudioEngine?
+  @ObservationIgnored private var request: SFSpeechAudioBufferRecognitionRequest?
+  @ObservationIgnored private var task: SFSpeechRecognitionTask?
+  @ObservationIgnored private var tapInstalled = false
+
+  private var markerURL: URL {
+    FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+      .appendingPathComponent("arm_diag_marker.txt")
+  }
+
+  private func mark(_ text: String) {
+    try? text.write(to: markerURL, atomically: true, encoding: .utf8)
+    UserDefaults.standard.set(text, forKey: armStepMarkerKey)
+    UserDefaults.standard.synchronize()
+  }
+
+  func pageOpened() {
+    if let saved = try? String(contentsOf: markerURL, encoding: .utf8) {
+      lastMarker = saved
+    }
+    mark("0-诊断页已打开")
+  }
+
+  // Stage 1: speech recognition authorization only.
+  func stage1Auth() {
+    mark("1-语音授权-开始")
+    authText = "请求中…"
+    SFSpeechRecognizer.requestAuthorization { status in
+      Task { @MainActor in
+        self.mark("1-语音授权-完成")
+        switch status {
+        case .authorized: self.authText = "已授权"
+        case .denied: self.authText = "被拒绝"
+        case .restricted: self.authText = "受限制（系统/家长控制）"
+        case .notDetermined: self.authText = "未决定"
+        @unknown default: self.authText = "未知状态"
+        }
+      }
+    }
+  }
+
+  // Stage 2: microphone record permission only.
+  func stage2Mic() {
+    mark("2-麦克风授权-开始")
+    micText = "请求中…"
+    AVAudioApplication.requestRecordPermission { granted in
+      Task { @MainActor in
+        self.mark("2-麦克风授权-完成")
+        self.micText = granted ? "已允许" : "被拒绝"
+      }
+    }
+  }
+
+  // Stage 3: audio session configuration only (same options as v1).
+  func stage3Session() {
+    mark("3-音频会话-开始")
+    do {
+      let session = AVAudioSession.sharedInstance()
+      try session.setCategory(
+        .playAndRecord, mode: .default,
+        options: [.duckOthers, .allowBluetoothHFP, .defaultToSpeaker])
+      try session.setActive(true, options: .notifyOthersOnDeactivation)
+      let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
+      sessionText = "配置成功；当前输入：\(inputs.isEmpty ? "（无）" : inputs)"
+      mark("3-音频会话-完成")
+    } catch {
+      sessionText = "失败：\(error.localizedDescription)"
+      mark("3-音频会话-失败")
+    }
+  }
+
+  // Stage 4: create the engine, prepare it, read the input format only.
+  func stage4Format() {
+    mark("4-引擎格式-开始")
+    if engine == nil {
+      engine = AVAudioEngine()
+    }
+    guard let engine else { return }
+    engine.prepare()
+    let format = engine.inputNode.outputFormat(forBus: 0)
+    formatText = "sampleRate=\(format.sampleRate), channels=\(format.channelCount)"
+    mark("4-引擎格式-完成 \(formatText)")
+  }
+
+  // Stage 5: install the tap and start the engine (needs stage 4 first).
+  func stage5Engine() {
+    mark("5-引擎启动-开始")
+    guard let engine else {
+      engineText = "先执行第 4 步"
+      return
+    }
+    let format = engine.inputNode.outputFormat(forBus: 0)
+    guard format.sampleRate > 0, format.channelCount > 0 else {
+      engineText = "输入格式无效（sampleRate=\(format.sampleRate)），不装采集"
+      mark("5-引擎启动-格式无效")
+      return
+    }
+    if request == nil {
+      request = SFSpeechAudioBufferRecognitionRequest()
+    }
+    guard let request else { return }
+    if !tapInstalled {
+      engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        request.append(buffer)
+      }
+      tapInstalled = true
+    }
+    engine.prepare()
+    do {
+      try engine.start()
+      engineText = "引擎运行中"
+      mark("5-引擎启动-完成")
+    } catch {
+      engineText = "启动失败：\(error.localizedDescription)"
+      mark("5-引擎启动-失败")
+    }
+  }
+
+  // Stage 6: create the recognizer and start a recognition task (needs 5).
+  func stage6Task() {
+    mark("6-识别任务-创建识别器")
+    guard let request else {
+      taskText = "先执行第 5 步"
+      return
+    }
+    guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) else {
+      taskText = "zh-CN 识别器创建失败（nil）"
+      mark("6-识别任务-识别器nil")
+      return
+    }
+    taskText = "识别器可用=\(recognizer.isAvailable)，设备端识别=\(recognizer.supportsOnDeviceRecognition)"
+    request.shouldReportPartialResults = true
+    request.contextualStrings = ArmCommandClient.moves.flatMap(\.phrases) + ["确认", "取消"]
+    mark("6-识别任务-启动")
+    task = recognizer.recognitionTask(with: request) { result, error in
+      let text = result?.bestTranscription.formattedString
+      Task { @MainActor in
+        if let text {
+          self.transcriptText = text
+        }
+        if let error {
+          self.taskText = "任务出错：\(error.localizedDescription)"
+        } else if result?.isFinal ?? false {
+          self.taskText = "任务结束（final）"
+        }
+      }
+    }
+    mark("6-识别任务-运行中")
+  }
+
+  func stopAll() {
+    task?.cancel()
+    task = nil
+    request?.endAudio()
+    request = nil
+    if let engine {
+      if engine.isRunning {
+        engine.stop()
+      }
+      if tapInstalled {
+        engine.inputNode.removeTap(onBus: 0)
+        tapInstalled = false
+      }
+    }
+    engineText = "已停止"
+    taskText = "已停止"
+  }
+}
+
+struct SpeechDiagView: View {
+  @State private var client = SpeechDiagClient()
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 14) {
+        Text("上次标记：\(client.lastMarker)")
+          .font(.system(size: 13, weight: .semibold))
+          .padding(10)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(Color.yellow.opacity(0.2))
+          .clipShape(RoundedRectangle(cornerRadius: 10))
+
+        Text("从 1 到 6 依次点，每步点完停一下看结果。若某一步 App 闪退，重开 App 回到本页，看「上次标记」停在哪一步。")
+          .font(.system(size: 13))
+          .foregroundStyle(.secondary)
+
+        stageButton("1 请求语音识别授权", result: client.authText) { client.stage1Auth() }
+        stageButton("2 请求麦克风授权", result: client.micText) { client.stage2Mic() }
+        stageButton("3 配置音频会话", result: client.sessionText) { client.stage3Session() }
+        stageButton("4 读麦克风输入格式", result: client.formatText) { client.stage4Format() }
+        stageButton("5 装采集并启动引擎", result: client.engineText) { client.stage5Engine() }
+        stageButton("6 启动识别任务", result: client.taskText) { client.stage6Task() }
+
+        if !client.transcriptText.isEmpty {
+          VStack(alignment: .leading, spacing: 4) {
+            Text("识别听到：").font(.headline)
+            Text(client.transcriptText)
+              .font(.system(size: 16, weight: .medium))
+          }
+          .padding(10)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(Color.green.opacity(0.15))
+          .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+
+        Button(role: .destructive) {
+          client.stopAll()
+        } label: {
+          Text("停止全部").frame(maxWidth: .infinity).frame(height: 44)
+        }
+        .buttonStyle(.bordered)
+      }
+      .padding()
+    }
+    .navigationTitle("语音识别诊断")
+    .navigationBarTitleDisplayMode(.inline)
+    .onAppear {
+      client.pageOpened()
+    }
+    .onDisappear {
+      client.stopAll()
+    }
+  }
+
+  private func stageButton(_ title: String, result: String, action: @escaping () -> Void) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Button(action: action) {
+        Text(title)
+          .font(.system(size: 16, weight: .semibold))
+          .frame(maxWidth: .infinity)
+          .frame(height: 44)
+      }
+      .buttonStyle(.borderedProminent)
+      Text(result)
+        .font(.system(size: 13))
+        .foregroundStyle(.secondary)
     }
   }
 }
