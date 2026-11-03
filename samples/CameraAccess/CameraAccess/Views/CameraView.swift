@@ -1076,7 +1076,10 @@ final class SpeechDiagClient {
       engine = AVAudioEngine()
     }
     guard let engine else { return }
-    engine.prepare()
+    // No prepare() here: on an empty graph it throws an uncaught
+    // NSException from AVAudioEngineGraph::Initialize (the stage-4 crash,
+    // see the 2026-11-03 11:11 crash log). Reading the input format does
+    // not need it, and start() initializes the graph on its own.
     let format = engine.inputNode.outputFormat(forBus: 0)
     formatText = "sampleRate=\(format.sampleRate), channels=\(format.channelCount)"
     mark("4-引擎格式-完成 \(formatText)")
@@ -1105,7 +1108,7 @@ final class SpeechDiagClient {
       }
       tapInstalled = true
     }
-    engine.prepare()
+    mark("5-tap已装-启动引擎")
     do {
       try engine.start()
       engineText = "引擎运行中"
