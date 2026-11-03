@@ -1103,9 +1103,7 @@ final class SpeechDiagClient {
     }
     guard let request else { return }
     if !tapInstalled {
-      engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-        request.append(buffer)
-      }
+      Self.installBufferTap(engine: engine, format: format, request: request)
       tapInstalled = true
     }
     mark("5-tap已装-启动引擎")
@@ -1151,6 +1149,19 @@ final class SpeechDiagClient {
       }
     }
     mark("6-识别任务-运行中")
+  }
+
+  // Nonisolated: the tap block must be created here, not in the MainActor
+  // stage method - a block formed in the isolated class inherits its
+  // isolation and traps on the audio real-time thread at the first
+  // buffer (the stage-5 crash, 2026-11-03 11:24 crash log).
+  nonisolated private static func installBufferTap(
+    engine: AVAudioEngine, format: AVAudioFormat,
+    request: SFSpeechAudioBufferRecognitionRequest
+  ) {
+    engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+      request.append(buffer)
+    }
   }
 
   // Nonisolated: the recognition result handler must not inherit MainActor
