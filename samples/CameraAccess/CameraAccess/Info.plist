@@ -67,6 +67,8 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This lets your phone find and connect to your glasses over Wi-Fi.</string>
 	<key>NSBonjourServices</key>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Used to recognize spoken chess-move commands for the robot arm.</string>
 	<array>
 		<string>_bonjour._tcp</string>
 	</array>
