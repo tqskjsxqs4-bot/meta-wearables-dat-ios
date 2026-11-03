@@ -637,6 +637,13 @@ struct UpdateRequiredMessage: View {
 //     finishes (synthesizer delegate), so the app cannot hear itself.
 // The glasses microphone is used when present: before listening, the
 // Bluetooth HFP input is preferred explicitly; otherwise the phone mic.
+//
+// v9 adds a wake-word loop: while enabled and the panel is idle, a
+// recognition task stays running and is restarted whenever it ends
+// (tasks are capped at about a minute). The wake word alone prompts
+// for a move name; wake word + move in one utterance goes straight to
+// the read-back. The read-back + explicit confirmation gates are
+// unchanged, so ambient speech cannot send a command by itself.
 
 private let armExecutorURL = URL(string: "http://192.168.1.97:8767/command")!
 private let armStepMarkerKey = "armCmdLastStep"
@@ -675,6 +682,10 @@ final class ArmCommandClient {
     Move(key: "home", label: "回位", phrases: ["回位", "回到原位"]),
   ]
 
+  // Wake word for the hands-free loop. Distinctive on purpose: ambient
+  // speech should not start a command flow by accident.
+  static let wakeWords = ["机械臂"]
+
   enum Phase: Equatable {
     case idle
     case listening
@@ -685,6 +696,7 @@ final class ArmCommandClient {
   }
 
   private(set) var phase: Phase = .idle
+  private(set) var wakeEnabled: Bool = false
   private(set) var logLines: [String] = []
   private(set) var heardText: String = ""
   private(set) var inputSource: String = ""
@@ -715,6 +727,8 @@ final class ArmCommandClient {
   @ObservationIgnored private var confirmTimer: Task<Void, Never>?
   @ObservationIgnored private var confirmListenTask: Task<Void, Never>?
   @ObservationIgnored private var listenTimeout: Task<Void, Never>?
+  @ObservationIgnored private var wakeRestartTask: Task<Void, Never>?
+  @ObservationIgnored private var listenStartedAt: Date?
 
   @ObservationIgnored private var audioEngine: AVAudioEngine?
   @ObservationIgnored private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -725,6 +739,7 @@ final class ArmCommandClient {
   private enum ListenMode {
     case move
     case confirm
+    case wake
   }
 
   init() {
@@ -773,6 +788,8 @@ final class ArmCommandClient {
   }
 
   func stopAll() {
+    wakeEnabled = false
+    wakeRestartTask?.cancel()
     confirmTimer?.cancel()
     confirmListenTask?.cancel()
     speechDelegate.onFinish = nil
@@ -805,6 +822,7 @@ final class ArmCommandClient {
     stopListeningPipeline()
     phase = .idle
     appendLog("语音口令已停止")
+    maybeStartWakeLoop()
   }
 
   private func ensureVoicePermissions() async -> Bool {
@@ -837,8 +855,10 @@ final class ArmCommandClient {
   }
 
   private func beginListening(mode: ListenMode) {
+    stopListeningPipeline()
     listenMode = mode
-    mark(mode == .move ? "聆听步名" : "聆听确认")
+    listenStartedAt = Date()
+    mark(mode == .move ? "聆听步名" : mode == .confirm ? "聆听确认" : "等待唤醒")
     do {
       let session = AVAudioSession.sharedInstance()
       try session.setCategory(
@@ -871,7 +891,7 @@ final class ArmCommandClient {
     }
     let request = SFSpeechAudioBufferRecognitionRequest()
     request.shouldReportPartialResults = true
-    request.contextualStrings = Self.moves.flatMap(\.phrases) + ["确认", "取消"]
+    request.contextualStrings = Self.moves.flatMap(\.phrases) + Self.wakeWords + ["确认", "取消"]
     recognitionRequest = request
     if !tapInstalled {
       Self.installBufferTap(engine: engine, format: format, request: request)
@@ -889,8 +909,11 @@ final class ArmCommandClient {
         self?.handleHeard(text: text, isFinal: isFinal, errorText: errorText)
       }
     }
-    appendLog("开始聆听（\(inputSource)）：\(mode == .move ? "说步名" : "说确认或取消")")
+    if mode != .wake {
+      appendLog("开始聆听（\(inputSource)）：\(mode == .move ? "说步名" : "说确认或取消")")
+    }
     listenTimeout?.cancel()
+    guard mode != .wake else { return }
     let seconds: Double = mode == .move ? 30 : 15
     listenTimeout = Task { @MainActor in
       try? await Task.sleep(for: .seconds(seconds))
@@ -905,6 +928,8 @@ final class ArmCommandClient {
         if case .confirming = self.phase {
           self.finishCancel(reason: "确认超时，已取消")
         }
+      case .wake:
+        break
       }
     }
   }
@@ -923,10 +948,16 @@ final class ArmCommandClient {
           appendLog("识别出错：\(errorText)")
           finishCancel(reason: "没听清，已取消")
         }
+      case .wake:
+        scheduleWakeRestart()
       }
       return
     }
     guard let text else { return }
+    if listenMode == .wake {
+      handleWakeText(text, isFinal: isFinal)
+      return
+    }
     heardText = text
     switch listenMode {
     case .move:
@@ -945,6 +976,85 @@ final class ArmCommandClient {
       } else if text.contains("确认") {
         appendLog("听到确认")
         confirmSend()
+      }
+    case .wake:
+      break
+    }
+  }
+
+  // MARK: Wake-word loop (hands-free start)
+
+  private var wakeCanRun: Bool {
+    switch phase {
+    case .idle, .done, .failed: return true
+    default: return false
+    }
+  }
+
+  func setWakeEnabled(_ on: Bool) {
+    wakeEnabled = on
+    mark(on ? "持续聆听-开" : "持续聆听-关")
+    if on {
+      appendLog("持续聆听已开启：喊「机械臂」或「机械臂，炮八平五」开始")
+      maybeStartWakeLoop()
+    } else {
+      wakeRestartTask?.cancel()
+      if listenMode == .wake {
+        stopListeningPipeline()
+      }
+      appendLog("持续聆听已关闭")
+    }
+  }
+
+  private func maybeStartWakeLoop() {
+    guard wakeEnabled, wakeCanRun else { return }
+    beginListening(mode: .wake)
+  }
+
+  private func scheduleWakeRestart() {
+    guard wakeCanRun else { return }
+    stopListeningPipeline()
+    guard wakeEnabled else { return }
+    wakeRestartTask?.cancel()
+    let elapsed = listenStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+    let delay: Double = elapsed < 2 ? 2.0 : 0.4
+    wakeRestartTask = Task { @MainActor in
+      try? await Task.sleep(for: .seconds(delay))
+      guard !Task.isCancelled, self.wakeEnabled, self.wakeCanRun else { return }
+      self.beginListening(mode: .wake)
+    }
+  }
+
+  private func handleWakeText(_ text: String, isFinal: Bool) {
+    guard wakeCanRun else { return }
+    let clean = text.replacingOccurrences(of: " ", with: "")
+    guard let wakeWord = Self.wakeWords.first(where: { clean.contains($0) }),
+          let range = clean.range(of: wakeWord)
+    else {
+      if isFinal {
+        scheduleWakeRestart()
+      }
+      return
+    }
+    heardText = text
+    let tail = String(clean[range.upperBound...])
+    if let move = Self.matchMove(in: tail) {
+      appendLog("唤醒并听到步名：\(move.label)")
+      stopListeningPipeline()
+      phase = .idle
+      selectMove(move)
+      return
+    }
+    // Wake word only: act on the final result, so a one-breath
+    // "wake + move" utterance is not cut off by its own first partial.
+    if isFinal {
+      appendLog("已唤醒，等待步名")
+      stopListeningPipeline()
+      phase = .listening
+      heardText = ""
+      speakThen("请说步名") { [weak self] in
+        guard let self, case .listening = self.phase else { return }
+        self.beginListening(mode: .move)
       }
     }
   }
@@ -1051,6 +1161,7 @@ final class ArmCommandClient {
     phase = .idle
     appendLog(reason)
     speak(reason)
+    maybeStartWakeLoop()
   }
 
   // MARK: Sending
@@ -1080,17 +1191,20 @@ final class ArmCommandClient {
             ? "已发送\(move.label)，当前干跑模式，机械臂没有动"
             : "已执行\(move.label)"
           phase = .done(text)
+          self.maybeStartWakeLoop()
           mark("已完成一轮")
           appendLog("执行端回复：\(text)")
           speak(text)
         } else {
           let message = (dict?["error"] as? String) ?? "HTTP \(status)"
           phase = .failed("执行端拒绝：\(message)")
+          self.maybeStartWakeLoop()
           appendLog("被拒绝：\(message)")
           speak("发送失败")
         }
       } catch {
         phase = .failed("网络错误：\(error.localizedDescription)")
+        self.maybeStartWakeLoop()
         appendLog("网络错误：\(error.localizedDescription)")
         speak("发送失败")
       }
@@ -1166,6 +1280,16 @@ struct ArmCommandView: View {
             .buttonStyle(.borderedProminent)
             .disabled(client.isBusy)
           }
+
+          Toggle("持续聆听唤醒（喊「机械臂」）", isOn: Binding(
+            get: { client.wakeEnabled },
+            set: { client.setWakeEnabled($0) }
+          ))
+          .font(.system(size: 16, weight: .medium))
+
+          Text("开启后不用点按钮：说「机械臂，炮八平五」，或先喊「机械臂」再说步名。仍要等复述后说「确认」才发送。本页需保持打开。")
+            .font(.system(size: 13))
+            .foregroundStyle(.secondary)
 
           if !client.inputSource.isEmpty {
             Text("麦克风：\(client.inputSource)")
