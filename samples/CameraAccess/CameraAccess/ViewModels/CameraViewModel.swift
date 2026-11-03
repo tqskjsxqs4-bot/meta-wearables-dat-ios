@@ -6,1034 +6,645 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//
-// CameraView.swift
-//
-// The capture screen: a full-bleed camera preview with controls overlaid on a
-// scrim. Walks the SDK's camera lifecycle as explicit steps (Start Session →
-// Start Streaming → Capture / Record → Stop Streaming → End Session) and shows the
-// live DeviceSessionState / StreamState so the state machine is legible.
-//
-
 import AVFoundation
+import MWDATCamera
 import MWDATCore
-import Speech
+import Observation
 import SwiftUI
 import UIKit
 
-private let updateRequiredTitle = "Update required"
-
-struct CameraView: View {
-  @State private var viewModel: CameraViewModel
-  @Bindable var wearablesVM: WearablesViewModel
-  @State private var showSettingsMenu: Bool = false
-  @State private var isLaunchingUpdate: Bool = false
-  @State private var showArmCommands: Bool = false
-
-  init(wearables: WearablesInterface, wearablesVM: WearablesViewModel) {
-    self._viewModel = State(wrappedValue: CameraViewModel(wearables: wearables))
-    self._wearablesVM = Bindable(wearablesVM)
+extension TimeInterval {
+  /// Formats a duration as `mm:ss`.
+  var formattedRecordingTime: String {
+    let minutes = Int(self) / 60
+    let seconds = Int(self) % 60
+    return String(format: "%02d:%02d", minutes, seconds)
   }
+}
 
-  private var isUpdateRequired: Bool {
-    wearablesVM.requiresFirmwareUpdate
-  }
+/// A capture awaiting preview/share — a still photo or a recorded video file.
+/// Drives a single `.sheet(item:)` so photo and video share one presentation.
+enum CapturePreview: Identifiable {
+  case photo(UIImage)
+  case video(URL)
 
-  /// Whether the preview is live or tearing down — drives the in-row Preview
-  /// toggle's icon, id, and action. (Recording implies a live preview.)
-  private var previewIsActive: Bool {
-    viewModel.isStreaming || viewModel.isRecording || viewModel.streamState == .stopping
-  }
-
-  var body: some View {
-    ZStack {
-      // Full-bleed preview (or a dark placeholder) fills the screen so overlaying
-      // the controls never reflows it.
-      previewBackground
-        .edgesIgnoringSafeArea(.all)
-
-      if let preview = viewModel.activePreview {
-        CapturePreviewView(
-          preview: preview,
-          onDismiss: { viewModel.dismissCapturePreview() }
-        )
-        .transition(.opacity)
-        .zIndex(1)
-      }
-
-      // Tap outside the open top-bar settings menu dismisses it.
-      if showSettingsMenu {
-        Color.clear
-          .contentShape(Rectangle())
-          .onTapGesture {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-              showSettingsMenu = false
-            }
-          }
-          .edgesIgnoringSafeArea(.all)
-      }
-
-      VStack(spacing: 0) {
-        topBar
-          .padding(.horizontal, 20)
-          .padding(.top, 16)
-          .padding(.bottom, 40)
-          .background(
-            LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
-              .edgesIgnoringSafeArea(.top)
-          )
-
-        Spacer(minLength: 0)
-
-        bottomBar
-      }
-    }
-    .animation(.spring(response: 0.42, dampingFraction: 0.86), value: viewModel.hasSession)
-    .animation(.easeInOut(duration: 0.2), value: previewIsActive)
-    .animation(.easeInOut(duration: 0.2), value: viewModel.isStreaming)
-    .animation(.easeInOut(duration: 0.2), value: viewModel.isPaused)
-    .animation(.easeInOut(duration: 0.2), value: viewModel.includeAudioInStream)
-    .animation(.easeInOut(duration: 0.2), value: viewModel.isRecording)
-    .alert("Something went wrong", isPresented: $viewModel.showError) {
-      Button("OK") { viewModel.dismissError() }
-    } message: {
-      Text(viewModel.errorMessage)
-    }
-    .alert("Allow camera access", isPresented: $viewModel.showCameraPermissionRedirectConfirm) {
-      Button("Continue") { Task { await viewModel.confirmCameraPermissionRedirect() } }
-      Button("Cancel", role: .cancel) {}
-    } message: {
-      Text("To preview your glasses camera, you'll be taken to the Meta AI app to grant access, then returned here.")
-    }
-    .navigationBarHidden(true)
-    .sheet(isPresented: $showArmCommands) {
-      ArmCommandView()
-    }
-  }
-
-  // MARK: - Preview background
-
-  @ViewBuilder
-  private var previewBackground: some View {
-    ZStack {
-      Color.black
-      if viewModel.showsLivePreview {
-        // Live preview, the frozen last frame while paused, or the last frame held
-        // while the stream tears down — so the paused badge / stop loader overlays
-        // the preview rather than the start-streaming screen.
-        LivePreviewView(viewModel: viewModel)
-        if viewModel.isPaused {
-          // Dim the frozen frame so the badge reads as intentionally paused.
-          Color.black.opacity(0.35)
-          pausedOverlay
-        }
-      } else if !viewModel.isBusy {
-        statusPlaceholder
-      }
-
-      // Loader overlays whatever is behind it during any in-flight transition.
-      if viewModel.isBusy {
-        loadingOverlay
-      }
-    }
-  }
-
-  /// Label over the frozen preview while paused, so a held frame reads as
-  /// intentionally paused (with how to resume) rather than a stalled feed. A
-  /// `pause.fill` status glyph (not a circled/button shape) — resume is a glasses
-  /// gesture, not an on-screen control.
-  private var pausedOverlay: some View {
-    VStack(spacing: 8) {
-      Image(systemName: "pause.fill")
-        .font(.system(size: 36))
-        .foregroundStyle(.white)
-      Text("Paused")
-        .font(.system(size: 20, weight: .semibold))
-        .foregroundStyle(.white)
-      Text("Tap your glasses to resume.")
-        .font(.system(size: 15))
-        .multilineTextAlignment(.center)
-        .foregroundStyle(Color.white.opacity(0.7))
-    }
-    .padding(.horizontal, 24)
-    .accessibilityIdentifier("paused_overlay")
-  }
-
-  /// Dimmed spinner shown over the preview (or placeholder) while a session/stream
-  /// start or stop is in flight.
-  private var loadingOverlay: some View {
-    ZStack {
-      Color.black.opacity(0.35)
-      ProgressView()
-        .scaleEffect(1.5)
-        .tint(.white)
-    }
-  }
-
-  @ViewBuilder
-  private var statusPlaceholder: some View {
-    if !viewModel.hasActiveDevice {
-      placeholder(title: "Put on your glasses", subtitle: nil, showWaitingRow: true)
-    } else if isUpdateRequired {
-      placeholder(title: updateRequiredTitle, subtitle: "Apply the update to start your camera.", showWaitingRow: false)
-    } else if !viewModel.hasSession {
-      placeholder(title: "Ready", subtitle: "Start a session to connect to your glasses.", showWaitingRow: false)
-    } else if viewModel.isPaused {
-      placeholder(title: "Paused", subtitle: "Tap your glasses to resume.", showWaitingRow: false)
-    } else {
-      placeholder(title: "Session started", subtitle: "Start the preview to see the live camera feed.", showWaitingRow: false)
-    }
-  }
-
-  private func placeholder(title: String, subtitle: String?, showWaitingRow: Bool) -> some View {
-    VStack(spacing: 12) {
-      Image(.cameraAccessIcon)
-        .resizable()
-        .renderingMode(.template)
-        .foregroundStyle(.white)
-        .aspectRatio(contentMode: .fit)
-        .frame(width: 88)
-
-      Text(title)
-        .font(.system(size: 20, weight: .semibold))
-        .foregroundStyle(.white)
-
-      if let subtitle {
-        Text(subtitle)
-          .font(.system(size: 15))
-          .multilineTextAlignment(.center)
-          .foregroundStyle(Color.white.opacity(0.7))
-      }
-
-      if showWaitingRow {
-        HStack(spacing: 8) {
-          Image(systemName: "hourglass")
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .foregroundStyle(Color.white.opacity(0.7))
-            .frame(width: 16, height: 16)
-          Text("Waiting for an active device")
-            .font(.system(size: 14))
-            .foregroundStyle(Color.white.opacity(0.7))
-        }
-      }
-    }
-    .padding(.horizontal, 24)
-  }
-
-  // MARK: - Top bar
-
-  /// Top bar: compact live SDK state stacked on the left so the lifecycle is
-  /// legible without heavy chrome, settings/disconnect on the right.
-  private var topBar: some View {
-    HStack(alignment: .top, spacing: 12) {
-      VStack(alignment: .leading, spacing: 6) {
-        statusChip(label: "Session", value: viewModel.sessionStateText, active: viewModel.isSessionActive, present: viewModel.hasSession)
-        statusChip(label: "Stream", value: viewModel.streamStateText, active: viewModel.isStreaming, present: viewModel.hasStream)
-      }
-
-      Spacer()
-
-      // Top bar carries only the app-level settings/Disconnect control.
-      iconButton("gearshape", id: "settings_button") {
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-          showSettingsMenu.toggle()
-        }
-      }
-      .overlay(alignment: .trailing) {
-        if showSettingsMenu {
-          CustomButton(
-            title: "Disconnect",
-            style: .destructive,
-            isDisabled: wearablesVM.registrationState != .registered
-          ) {
-            wearablesVM.disconnectGlasses()
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { showSettingsMenu = false }
-          }
-          .frame(width: 120)
-          .offset(y: 44)
-          .transition(.scale(scale: 0.01, anchor: .topTrailing).combined(with: .opacity))
-        }
-      }
-    }
-  }
-
-  private func statusChip(label: String, value: String, active: Bool, present: Bool) -> some View {
-    HStack(spacing: 6) {
-      Circle()
-        .fill(active ? Color.green : (present ? Color.yellow : Color.gray))
-        .frame(width: 7, height: 7)
-      Text("\(label): \(value)")
-        .font(.system(size: 12, weight: .medium))
-        .monospaced()
-        .foregroundStyle(Color.white.opacity(0.85))
-    }
-  }
-
-  private func iconButton(_ systemName: String, id: String, action: @escaping () -> Void) -> some View {
-    Button(action: action) {
-      Image(systemName: systemName)
-        .resizable()
-        .aspectRatio(contentMode: .fit)
-        .foregroundStyle(.white)
-        .frame(width: 22, height: 22)
-        .padding(.leading, 16)
-    }
-    .accessibilityIdentifier(id)
-  }
-
-  // MARK: - Bottom bar
-
-  private var bottomBar: some View {
-    VStack(spacing: 14) {
-      if isUpdateRequired {
-        updateControls
-      } else {
-        // Reserved capture-row space + a single persistent button hold the button at
-        // a fixed Y across every state.
-        armCommandRow
-        captureRow
-        anchoredPrimaryButton
-      }
-    }
-    .frame(maxWidth: .infinity)
-    .padding(.horizontal, 24)
-    .padding(.top, 48)
-    .padding(.bottom, 28)
-    .background(
-      LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .top, endPoint: .bottom)
-        .edgesIgnoringSafeArea(.bottom)
-    )
-  }
-
-  /// Opens the arm voice-command sheet. The command channel is independent
-  /// of the camera session: it talks to the yahboom executor over Wi-Fi.
-  private var armCommandRow: some View {
-    capturePill(icon: "mic.fill", title: "机械臂口令", contentTint: .white, id: "arm_command_button") {
-      showArmCommands = true
-    }
-  }
-
-  /// In-session toolbar (Preview / Photo / Record / Mic), kept laid out so the
-  /// session button below holds a fixed Y. Hidden without a session; Preview leads as
-  /// the gateway and is the lone enabled control in session-ready, the rest enabling
-  /// once streaming.
-  private var captureRow: some View {
-    HStack(spacing: 10) {
-      previewPill
-      photoButton
-      recordPill
-      micToggle
-    }
-    .opacity(viewModel.hasSession ? 1 : 0)
-  }
-
-  /// Photo and Record need a live stream.
-  private var captureControlsEnabled: Bool { viewModel.isStreaming }
-  /// Record/Stop stays available while recording even if the stream is paused, so a
-  /// pause can't trap an in-progress recording; starting still needs a live stream.
-  private var recordControlEnabled: Bool { viewModel.isStreaming || viewModel.isRecording }
-  /// Mic additionally locks once recording starts — the audio setting can't change
-  /// mid-take.
-  private var micEnabled: Bool { viewModel.isStreaming && !viewModel.isRecording }
-
-  /// Photo capture as a compact icon (no label) so the Preview and Record pills keep
-  /// room for text. Enabled while streaming, including during a recording.
-  private var photoButton: some View {
-    Button {
-      viewModel.capturePhoto()
-    } label: {
-      Image(systemName: "camera.fill")
-        .font(.system(size: 16, weight: .semibold))
-        .foregroundStyle(.white)
-        .frame(width: 50, height: 50)
-        .background(.ultraThinMaterial)
-        .clipShape(Circle())
-    }
-    .accessibilityIdentifier("capture_button")
-    .disabled(!captureControlsEnabled)
-    .opacity(captureControlsEnabled ? 1 : 0.35)
-  }
-
-  /// Preview on/off — the gateway for capture. The eye icon flips and dims when off;
-  /// locked mid-recording so a recording can't lose its feed.
-  private var previewPill: some View {
-    capturePill(
-      icon: previewIsActive ? "eye.fill" : "eye.slash.fill",
-      title: "Preview",
-      contentTint: .white,
-      id: previewIsActive ? "stop_preview_button" : "start_preview_button"
-    ) {
-      if previewIsActive {
-        viewModel.stopStreaming()
-      } else {
-        Task { await viewModel.startStreaming() }
-      }
-    }
-    .disabled(previewToggleDisabled)
-    .opacity(previewToggleDisabled ? 0.35 : 1)
-  }
-
-  private var previewToggleDisabled: Bool {
-    if previewIsActive {
-      return viewModel.isRecording || viewModel.isBusy
-    }
-    return !viewModel.isSessionActive || viewModel.isBusy
-  }
-
-  /// The single full-width session button: Start Session, or End Session
-  /// (destructive) once a session exists. One instance, never branched, so it never
-  /// remounts and holds a fixed Y — only its title / style / id / action change.
-  private var anchoredPrimaryButton: some View {
-    CustomButton(
-      title: viewModel.hasSession ? "End session" : "Start session",
-      style: viewModel.hasSession ? .destructive : .primary,
-      isDisabled: primaryDisabled
-    ) {
-      if viewModel.hasSession {
-        viewModel.endSession()
-      } else {
-        viewModel.startSession()
-      }
-    }
-    .accessibilityIdentifier(viewModel.hasSession ? "end_session_button" : "start_session_button")
-  }
-
-  /// Start needs an active device; End stays available mid-stream/record — the SDK
-  /// cascades the stop, so only an in-flight transition disables it.
-  private var primaryDisabled: Bool {
-    if viewModel.hasSession {
-      return viewModel.isBusy
-    }
-    return viewModel.isBusy || !viewModel.hasActiveDevice
-  }
-
-  private func primaryButton(_ title: String, id: String, disabled: Bool = false, action: @escaping () -> Void) -> some View {
-    CustomButton(title: title, style: .primary, isDisabled: disabled, action: action)
-      .accessibilityIdentifier(id)
-  }
-
-  /// Frosted icon+label capsule for the capture actions. `contentTint` colors both
-  /// the icon and label so on/off dims them together (see `previewPill`).
-  private func capturePill(icon: String, title: String, contentTint: Color = .white, id: String, action: @escaping () -> Void) -> some View {
-    Button(action: action) {
-      HStack(spacing: 8) {
-        Image(systemName: icon)
-          .font(.system(size: 15, weight: .semibold))
-          .foregroundStyle(contentTint)
-        Text(title)
-          .font(.system(size: 15, weight: .semibold))
-          .foregroundStyle(contentTint)
-          .lineLimit(1)
-          .minimumScaleFactor(0.85)
-      }
-      .frame(maxWidth: .infinity)
-      .frame(height: 50)
-      .background(.ultraThinMaterial)
-      .clipShape(Capsule())
-    }
-    .accessibilityIdentifier(id)
-  }
-
-  /// Record/Stop capsule. Morphs in place while recording (red fill + the live timer
-  /// in the isolated `RecordingTimerLabel`) so the bar keeps its shape and the
-  /// per-frame timer doesn't re-render the surrounding controls.
-  private var recordPill: some View {
-    Button {
-      viewModel.toggleRecording()
-    } label: {
-      Group {
-        if viewModel.isRecording {
-          RecordingTimerLabel(viewModel: viewModel)
-        } else {
-          HStack(spacing: 8) {
-            Image(systemName: "video.fill")
-              .font(.system(size: 15, weight: .semibold))
-              .foregroundStyle(Color.recordAccent)
-            Text("Record")
-              .font(.system(size: 15, weight: .semibold))
-              .foregroundStyle(.white)
-          }
-        }
-      }
-      .frame(maxWidth: .infinity)
-      .frame(height: 50)
-      .background {
-        if viewModel.isRecording {
-          ZStack {
-            Capsule().fill(.ultraThinMaterial)
-            Capsule().fill(Color.recordAccent.opacity(0.50))
-          }
-        } else {
-          Capsule().fill(.ultraThinMaterial)
-        }
-      }
-    }
-    .accessibilityIdentifier("record_button")
-    .disabled(!recordControlEnabled)
-    .opacity(recordControlEnabled ? 1 : 0.35)
-  }
-
-  /// Sound-in-video toggle. Brightens on, dims/slashes when muted; locked until
-  /// streaming and during recording. Denied reads as off and, since iOS won't
-  /// re-prompt, tapping it opens Settings instead of toggling.
-  private var micToggle: some View {
-    let isOn = !viewModel.micDenied && viewModel.includeAudioInStream
-    return Button {
-      if viewModel.micDenied {
-        if let url = URL(string: UIApplication.openSettingsURLString) {
-          UIApplication.shared.open(url)
-        }
-      } else {
-        viewModel.includeAudioInStream.toggle()
-      }
-    } label: {
-      Image(systemName: isOn ? "mic.fill" : "mic.slash.fill")
-        .font(.system(size: 16, weight: .semibold))
-        .foregroundStyle(isOn ? .white : Color.white.opacity(0.45))
-        .frame(width: 50, height: 50)
-        .background(.ultraThinMaterial)
-        .clipShape(Circle())
-    }
-    .disabled(!micEnabled)
-    .opacity(micEnabled ? 1 : 0.35)
-    .accessibilityIdentifier("mic_toggle")
-  }
-
-  // MARK: - Update controls
-
-  @ViewBuilder
-  private var updateControls: some View {
-    UpdateRequiredMessage()
-    // Gate the button while the external update flow launches so a double-tap can't
-    // fire it twice; re-enabled once the await returns.
-    primaryButton("Update firmware", id: "update_firmware_button", disabled: isLaunchingUpdate) {
-      isLaunchingUpdate = true
-      Task {
-        await wearablesVM.openFirmwareUpdate()
-        isLaunchingUpdate = false
-      }
+  var id: String {
+    switch self {
+    case .photo: return "photo"
+    case .video(let url): return "video:\(url.absoluteString)"
     }
   }
 }
 
-// MARK: - Live preview
-
-/// The streaming preview image. Isolated from `CameraView` so frequent
-/// (~24fps) `currentVideoFrame` updates re-render only this view, not the
-/// surrounding controls.
-private struct LivePreviewView: View {
-  var viewModel: CameraViewModel
-
-  var body: some View {
-    if let videoFrame = viewModel.currentVideoFrame, viewModel.hasReceivedFirstFrame {
-      GeometryReader { geometry in
-        Image(uiImage: videoFrame)
-          .resizable()
-          .aspectRatio(contentMode: .fill)
-          .frame(width: geometry.size.width, height: geometry.size.height)
-          .clipped()
-      }
-    } else {
-      ProgressView()
-        .scaleEffect(1.5)
-        .tint(.white)
-    }
-  }
-}
-
-// MARK: - Recording timer
-
-/// Elapsed-time label shown inside the record button while recording. Self-drives
-/// off the recording start via `TimelineView`, so it counts continuously — including
-/// through a stream pause — and re-renders only this isolated label.
-private struct RecordingTimerLabel: View {
-  var viewModel: CameraViewModel
-
-  var body: some View {
-    HStack(spacing: 8) {
-      Image(systemName: "stop.fill")
-        .font(.system(size: 15, weight: .semibold))
-        .foregroundStyle(Color.recordAccent)
-      // Counts from the actual recording start (first written frame), so it tracks the
-      // saved clip and keeps advancing through a pause; shows 00:00 until that frame.
-      if let start = viewModel.recordingStartDate {
-        TimelineView(.periodic(from: start, by: 1)) { context in
-          timerText(context.date.timeIntervalSince(start))
-        }
-      } else {
-        timerText(0)
-      }
-    }
-  }
-
-  private func timerText(_ elapsed: TimeInterval) -> some View {
-    Text(elapsed.formattedRecordingTime)
-      .font(.system(size: 15, weight: .semibold))
-      .monospacedDigit()
-      .foregroundStyle(.white)
-      // Identifier on the Text so UI tests find it regardless of the time value.
-      .accessibilityIdentifier("recording_indicator")
-  }
-}
-
-// MARK: - Update banner
-
-struct UpdateRequiredMessage: View {
-  private let message = "Your glasses need a firmware update before Camera Access can start."
-
-  var body: some View {
-    HStack(alignment: .top, spacing: 12) {
-      Image(systemName: "exclamationmark.triangle.fill")
-        .resizable()
-        .aspectRatio(contentMode: .fit)
-        .foregroundStyle(Color.updateRequiredForeground)
-        .frame(width: 24, height: 24)
-        .accessibilityHidden(true)
-
-      VStack(alignment: .leading, spacing: 4) {
-        Text(updateRequiredTitle)
-          .font(.system(size: 16, weight: .semibold))
-          .foregroundStyle(Color.updateRequiredForeground)
-
-        Text(message)
-          .font(.system(size: 15))
-          .foregroundStyle(Color.updateRequiredForeground)
-          .fixedSize(horizontal: false, vertical: true)
-      }
-
-      Spacer(minLength: 0)
-    }
-    .padding(.all, 16)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(Color.updateRequiredBackground)
-    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-  }
-}
-
-
-// MARK: - Arm voice commands (yahboom executor)
-//
-// Voice control for the chess arm. Say a move name; the app reads it back and
-// only after an explicit confirmation (saying a confirm word, or tapping the
-// on-screen button) POSTs {move, confirmed: true} to the executor service on
-// the yahboom (port 8767). The executor enforces its own whitelist and its
-// on-device dry-run / live mode; this app never talks to the arm's joint
-// service directly. Confirmation listening starts only after the read-back
-// prompt finishes speaking, so the app cannot "confirm itself" by hearing
-// its own prompt through the microphone.
-
-private let armExecutorURL = URL(string: "http://192.168.1.97:8767/command")!
-
-@MainActor
+/// Drives the camera screen by exercising the SDK's camera lifecycle as explicit
+/// steps: create/start a `DeviceSession`, add and start a `Stream`, capture or
+/// record, stop the stream, end the session. Owns the screen-scoped pieces —
+/// active-device monitoring, the `DeviceSession`, and its `Stream`. The UI binds to
+/// the SDK's own `DeviceSessionState` / `StreamState` so the sample shows the real
+/// state machine.
 @Observable
-final class ArmCommandClient: NSObject {
-  struct Move: Identifiable, Equatable {
-    let key: String
-    let label: String
-    let phrases: [String]
-    var id: String { key }
-  }
+@MainActor
+final class CameraViewModel {
+  // MARK: - Device
 
-  // Mirrors the executor whitelist on the yahboom. Uncalibrated or
-  // unconfirmed moves (e.g. g3g4) are deliberately absent here too.
-  static let moves: [Move] = [
-    Move(key: "b2e2", label: "炮八平五", phrases: ["炮八平五"]),
-    Move(key: "b0c2", label: "马八进七", phrases: ["马八进七"]),
-    Move(key: "h0g2", label: "马二进三", phrases: ["马二进三"]),
-    Move(key: "a0b0", label: "车九平八", phrases: ["车九平八"]),
-    Move(key: "c2d4", label: "马七进六", phrases: ["马七进六"]),
-    Move(key: "c3c4", label: "兵七进一", phrases: ["兵七进一"]),
-    Move(key: "e3e4", label: "兵五进一", phrases: ["兵五进一"]),
-    Move(key: "home", label: "回位", phrases: ["回位", "回到原位"]),
-  ]
-  private static let confirmPhrases = ["确认", "确定", "执行"]
-  private static let cancelPhrases = ["取消", "不要", "算了", "停"]
+  /// Whether an eligible device is currently active. Drives the "Put on your
+  /// glasses" placeholder. Sourced from the auto device selector.
+  private(set) var hasActiveDevice: Bool = false
 
-  enum Phase: Equatable {
-    case idle
-    case listening
-    case confirming(Move)
-    case sending(Move)
-    case done(String)
-    case failed(String)
-  }
+  // MARK: - Session state (bound directly to the SDK)
 
-  private(set) var phase: Phase = .idle
-  private(set) var heardText: String = ""
-  private(set) var logLines: [String] = []
+  /// The device session's state, mirrored from `DeviceSession.statePublisher`.
+  /// `.idle`/`.stopped` mean no live session.
+  var sessionState: DeviceSessionState = .idle
 
-  var isListening: Bool { phase == .listening }
-  var pendingMove: Move? {
-    if case .confirming(let move) = phase { return move }
-    return nil
-  }
-  var statusText: String {
-    switch phase {
-    case .idle: return "点「开始听口令」，说出步名"
-    case .listening: return "正在听…说出步名（如：兵五进一）"
-    case .confirming(let move): return "听到「\(move.label)」，说「确认」发送，或点按钮"
-    case .sending(let move): return "正在发送「\(move.label)」…"
-    case .done(let text): return text
-    case .failed(let text): return "出错：\(text)"
+  // MARK: - Preview
+
+  /// The latest decoded preview frame. Read only by the isolated `LivePreviewView`
+  /// so the ~24fps updates don't re-render the whole screen.
+  var currentVideoFrame: UIImage?
+  var hasReceivedFirstFrame: Bool = false
+
+  /// The stream's state, mirrored from `Stream.statePublisher`. `.stopped` means
+  /// no live stream.
+  var streamState: StreamState = .stopped
+
+  // MARK: - Capture preview
+
+  /// The capture currently shown in the preview/share sheet (photo or video).
+  var activePreview: CapturePreview?
+  var isCapturingPhoto: Bool = false
+
+  // MARK: - Video recording
+
+  var isRecording: Bool = false
+  /// Wall-clock start of the active recording (first written frame), mirrored from the
+  /// recorder. Drives the isolated `RecordingTimerLabel`'s `TimelineView`, so the timer
+  /// counts continuously — including through a stream pause. `nil` when not recording.
+  var recordingStartDate: Date?
+  /// Whether to record the glasses-microphone (Bluetooth HFP) audio into videos
+  /// (sound-in-video). Toggled from the mic button shown while streaming.
+  var includeAudioInStream: Bool = true
+  /// Mic denied — iOS won't re-prompt. Drives the toggle's disabled look + tap-to-Settings.
+  /// Still required for glasses audio: iOS gates HFP capture behind mic permission too.
+  var micDenied: Bool { AVAudioApplication.shared.recordPermission == .denied }
+
+  // MARK: - Errors
+
+  /// Drives the single error alert. Uses the SDK's own `localizedDescription`
+  /// rather than an app-maintained error map.
+  var showError: Bool = false
+  var errorMessage: String = ""
+
+  /// Drives the confirm prompt shown before the camera-permission redirect to the
+  /// Meta AI app — surfaced only when permission isn't already granted.
+  var showCameraPermissionRedirectConfirm: Bool = false
+
+  // MARK: - Derived session state
+
+  var isSessionStarting: Bool { sessionState == .starting }
+  var isSessionActive: Bool { sessionState == .started }
+  /// A session exists and is connected (or connecting); a stream can be started.
+  var hasSession: Bool {
+    switch sessionState {
+    case .starting, .started, .paused, .stopping: return true
+    case .idle, .stopped: return false
     }
   }
 
-  @ObservationIgnored private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
-  @ObservationIgnored private let audioEngine = AVAudioEngine()
-  @ObservationIgnored private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-  @ObservationIgnored private var recognitionTask: SFSpeechRecognitionTask?
-  @ObservationIgnored private let synthesizer = AVSpeechSynthesizer()
-  @ObservationIgnored private var confirmTimer: Task<Void, Never>?
-  @ObservationIgnored private var recognitionRunning = false
-  @ObservationIgnored private var tapInstalled = false
+  /// Human-readable session state for the status line.
+  var sessionStateText: String { sessionState.description }
 
-  override init() {
-    super.init()
-    synthesizer.delegate = self
+  // MARK: - Derived stream state
+
+  var isStreaming: Bool { streamState == .streaming }
+  /// A stream is attached (in any non-terminal state).
+  var hasStream: Bool { streamState != .stopped }
+
+  /// A session or stream start/stop is in flight. The UI shows a spinner and
+  /// disables the controls until the SDK settles on a stable state, so transient
+  /// states never need their own controls or labels.
+  var isBusy: Bool {
+    isSessionStarting || sessionState == .stopping
+      || streamState == .starting || streamState == .waitingForDevice || streamState == .stopping
   }
 
-  // MARK: Controls used by the view
-
-  func toggleListening() {
-    switch phase {
-    case .listening:
-      stopAll()
-    case .idle, .done, .failed:
-      requestPermissionsAndStart()
-    case .confirming, .sending:
-      break
+  /// Human-readable stream state for the status line. `StreamState` has no
+  /// `description`, so map it here.
+  var streamStateText: String {
+    switch streamState {
+    case .streaming: return "streaming"
+    case .starting: return "starting"
+    case .waitingForDevice: return "waiting for device"
+    case .stopping: return "stopping"
+    case .stopped: return "stopped"
+    case .paused: return "paused"
     }
   }
 
-  func confirmSend() {
-    guard case .confirming(let move) = phase else { return }
-    beginSend(move)
+  /// The stream is paused (device-initiated, e.g. a single cap-touch tap). The
+  /// last frame is retained, so the preview can stay on screen frozen.
+  var isPaused: Bool { streamState == .paused }
+
+  /// The preview surface (live frames, or the last held frame) should fill the
+  /// screen: while streaming, while paused (frozen on the last frame), or while
+  /// tearing down with a last frame so the stop loader overlays the preview.
+  var showsLivePreview: Bool {
+    isStreaming
+      || ((streamState == .paused || streamState == .stopping) && currentVideoFrame != nil)
   }
 
-  func cancelPending() {
-    guard case .confirming = phase else { return }
-    finishCancel(reason: "已取消")
-  }
+  // MARK: - Private
 
-  func stopAll() {
-    confirmTimer?.cancel()
-    stopRecognition()
-    synthesizer.stopSpeaking(at: .immediate)
-    if phase == .listening || pendingMove != nil {
-      phase = .idle
-    }
-  }
+  @ObservationIgnored private let wearables: WearablesInterface
+  @ObservationIgnored private let deviceSelector: AutoDeviceSelector
+  @ObservationIgnored private var deviceSession: DeviceSession?
+  @ObservationIgnored private var camera: MWDATCamera.Camera?
+  @ObservationIgnored private var isStoppingForBackground: Bool = false
+  @ObservationIgnored private var backgroundStopSuppressionTask: Task<Void, Never>?
 
-  // MARK: Permissions + recognition
+  @ObservationIgnored private let videoRecorder = VideoRecorder()
+  // Decodes compressed hvc1 frames for on-screen preview. Not required for
+  // recording — the passthrough writer handles compressed frames directly.
+  @ObservationIgnored private let videoFrameDecoder = VideoFrameDecoder()
 
-  private func requestPermissionsAndStart() {
-    SFSpeechRecognizer.requestAuthorization { status in
-      Task { @MainActor in
-        guard status == .authorized else {
-          self.phase = .failed("语音识别未授权，请到系统设置里允许")
-          return
-        }
-        AVAudioApplication.requestRecordPermission { granted in
-          Task { @MainActor in
-            guard granted else {
-              self.phase = .failed("麦克风未授权，请到系统设置里允许")
-              return
-            }
-            self.phase = .listening
-            self.heardText = ""
-            self.startRecognition()
-          }
-        }
-      }
-    }
-  }
+  // FPV upload to Pi: same-Wi-Fi LAN IP by default. If the Tailscale app
+  // runs on this phone, swap to http://100.93.202.74:8766/frame instead.
+  @ObservationIgnored private let piFrameURL =
+    URL(string: "http://192.168.1.75:8766/frame")!
+  // Second FPV copy for the Yahboom arm device: a view-only receiver on
+  // the same LAN (no recognition there). Used during grasping sessions
+  // so the arm operator can see the first-person view.
+  @ObservationIgnored private let armFrameURL =
+    URL(string: "http://192.168.1.97:8766/frame")!
+  @ObservationIgnored private var lastPiUpload = Date.distantPast
+  // Pi face-result announcement: speak a recognized name via TTS. With the
+  // glasses as the phone's Bluetooth audio output, it plays on the glasses.
+  // Debounced in uploadFrameToPi so the same face is not announced every frame.
+  @ObservationIgnored private var lastAnnouncedName: String?
+  @ObservationIgnored private var lastAnnounceTime = Date.distantPast
+  @ObservationIgnored private let piSpeech = AVSpeechSynthesizer()
 
-  private func startRecognition() {
-    guard let recognizer, recognizer.isAvailable else {
-      phase = .failed("语音识别当前不可用")
-      return
-    }
-    stopRecognition()
-    do {
-      let session = AVAudioSession.sharedInstance()
-      try session.setCategory(
-        .playAndRecord, mode: .default,
-        options: [.duckOthers, .allowBluetoothHFP, .defaultToSpeaker])
-      try session.setActive(true, options: .notifyOthersOnDeactivation)
-    } catch {
-      phase = .failed("音频会话启动失败：\(error.localizedDescription)")
-      return
-    }
-    let request = SFSpeechAudioBufferRecognitionRequest()
-    request.shouldReportPartialResults = true
-    request.contextualStrings =
-      Self.moves.flatMap(\.phrases) + Self.confirmPhrases + Self.cancelPhrases
-    recognitionRequest = request
-    let inputNode = audioEngine.inputNode
-    let format = inputNode.outputFormat(forBus: 0)
-    inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-      request.append(buffer)
-    }
-    tapInstalled = true
-    audioEngine.prepare()
-    do {
-      try audioEngine.start()
-    } catch {
-      stopRecognition()
-      phase = .failed("麦克风启动失败：\(error.localizedDescription)")
-      return
-    }
-    recognitionRunning = true
-    recognitionTask = recognizer.recognitionTask(with: request) { result, error in
-      let transcript = result?.bestTranscription.formattedString
-      let ended = (error != nil) || (result?.isFinal ?? false)
-      Task { @MainActor in
-        guard self.recognitionRunning else { return }
-        if let transcript {
-          self.handleTranscript(transcript)
-        }
-        if ended, self.recognitionRunning, error != nil {
-          self.stopRecognition()
-          if self.phase == .listening || self.pendingMove != nil {
-            self.confirmTimer?.cancel()
-            self.phase = .failed("识别中断：\(error!.localizedDescription)")
-          }
-        }
-      }
-    }
-  }
+  @ObservationIgnored private var deviceMonitorTask: Task<Void, Never>?
+  @ObservationIgnored private var appLifecycleTask: Task<Void, Never>?
+  @ObservationIgnored private let sessionTokenBag = ListenerTokenBag()
+  @ObservationIgnored private let streamTokenBag = ListenerTokenBag()
 
-  private func stopRecognition() {
-    recognitionRunning = false
-    if audioEngine.isRunning {
-      audioEngine.stop()
-    }
-    if tapInstalled {
-      audioEngine.inputNode.removeTap(onBus: 0)
-      tapInstalled = false
-    }
-    recognitionRequest?.endAudio()
-    recognitionTask?.cancel()
-    recognitionRequest = nil
-    recognitionTask = nil
-  }
+  @ObservationIgnored private let photoCaptureFailureMessage =
+    "Couldn't capture photo. There may not be enough storage, or another capture is in progress. Try again in a few moments."
+  @ObservationIgnored private let backgroundStopErrorSuppressionTimeout: Duration
 
-  // MARK: Transcript state machine
+  // MARK: - Init
 
-  private func handleTranscript(_ raw: String) {
-    let text = raw.replacingOccurrences(of: " ", with: "")
-    heardText = text
-    switch phase {
-    case .listening:
-      if let move = Self.moves.first(where: { move in
-        move.phrases.contains(where: { text.contains($0) })
-      }) {
-        appendLog("识别到口令：\(move.label)（\(move.key)）")
-        stopRecognition()
-        phase = .confirming(move)
-        // Confirmation listening starts in the speech delegate, after this
-        // prompt has finished playing, so the mic never hears the prompt.
-        speak("你要走\(move.label)，请说确认，或点屏幕按钮")
-      }
-    case .confirming(let move):
-      if Self.confirmPhrases.contains(where: { text.contains($0) }) {
-        beginSend(move)
-      } else if Self.cancelPhrases.contains(where: { text.contains($0) }) {
-        finishCancel(reason: "已取消")
-      }
-    default:
-      break
-    }
-  }
-
-  private func startConfirmTimer() {
-    confirmTimer?.cancel()
-    confirmTimer = Task { @MainActor in
-      try? await Task.sleep(for: .seconds(10))
-      guard !Task.isCancelled, case .confirming = self.phase else { return }
-      self.finishCancel(reason: "确认超时，已取消")
-    }
-  }
-
-  private func finishCancel(reason: String) {
-    confirmTimer?.cancel()
-    stopRecognition()
-    phase = .idle
-    appendLog(reason)
-    speak(reason)
-  }
-
-  // MARK: Sending
-
-  private func beginSend(_ move: Move) {
-    confirmTimer?.cancel()
-    stopRecognition()
-    phase = .sending(move)
-    appendLog("发送指令：\(move.key)")
-    Task { @MainActor in
-      do {
-        var request = URLRequest(url: armExecutorURL)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-          "move": move.key,
-          "confirmed": true,
-          "source": "glasses-app",
-        ])
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        let object = try? JSONSerialization.jsonObject(with: data)
-        let dict = object as? [String: Any]
-        if status == 200, (dict?["ok"] as? Bool) == true {
-          let mode = dict?["mode"] as? String ?? "?"
-          let text = mode == "dry-run"
-            ? "已发送\(move.label)，当前干跑模式，机械臂没有动"
-            : "已执行\(move.label)"
-          phase = .done(text)
-          appendLog("执行端回复：\(text)")
-          speak(text)
-        } else {
-          let message = (dict?["error"] as? String) ?? "HTTP \(status)"
-          phase = .failed("执行端拒绝：\(message)")
-          appendLog("被拒绝：\(message)")
-          speak("发送失败")
-        }
-      } catch {
-        phase = .failed("网络错误：\(error.localizedDescription)")
-        appendLog("网络错误：\(error.localizedDescription)")
-        speak("发送失败")
-      }
-    }
-  }
-
-  // MARK: Speech out + log
-
-  private func speak(_ text: String) {
-    let utterance = AVSpeechUtterance(string: text)
-    utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-    synthesizer.stopSpeaking(at: .immediate)
-    synthesizer.speak(utterance)
-  }
-
-  private func appendLog(_ line: String) {
-    logLines.append(line)
-    if logLines.count > 30 {
-      logLines.removeFirst(logLines.count - 30)
-    }
-  }
-}
-
-extension ArmCommandClient: AVSpeechSynthesizerDelegate {
-  nonisolated func speechSynthesizer(
-    _ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance
+  init(
+    wearables: WearablesInterface,
+    backgroundStopErrorSuppressionTimeout: Duration = .seconds(5)
   ) {
-    Task { @MainActor in
-      // Only the read-back prompt leads anywhere: begin confirmation
-      // listening (plus its timeout) once the prompt is fully spoken.
-      guard case .confirming = self.phase, !self.recognitionRunning else { return }
-      self.startRecognition()
-      self.startConfirmTimer()
+    self.wearables = wearables
+    self.deviceSelector = AutoDeviceSelector(wearables: wearables)
+    self.backgroundStopErrorSuppressionTimeout = backgroundStopErrorSuppressionTimeout
+    startDeviceMonitoring()
+    startAppLifecycleMonitoring()
+  }
+
+  isolated deinit {
+    deviceMonitorTask?.cancel()
+    appLifecycleTask?.cancel()
+    backgroundStopSuppressionTask?.cancel()
+    deviceSession?.stop()
+  }
+
+  // MARK: - Lifecycle step 1: session
+
+  /// Creates and starts a `DeviceSession` (no stream yet). This is the first
+  /// explicit step — a session can stay connected with no active stream. The
+  /// state observer drives `sessionState`; we only seed an optimistic
+  /// `.starting` so the UI reflects the in-flight request immediately.
+  func startSession() {
+    guard !hasSession else { return }
+    do throws(DeviceSessionError) {
+      let session = try wearables.createSession(deviceSelector: deviceSelector)
+      deviceSession = session
+      // Subscribe before start() so no initial state transitions are missed.
+      observeSession(session)
+      // Reflect the in-flight request immediately; the observer drives it onward.
+      sessionState = .starting
+      try session.start()
+    } catch {
+      handleSessionError(error)
+      sessionState = .idle
+      cleanupSession()
     }
   }
-}
 
-struct ArmCommandView: View {
-  @State private var client = ArmCommandClient()
-  @Environment(\.dismiss) private var dismiss
+  /// Stops the stream (if any) and ends the device session. `stop()` is terminal;
+  /// the SDK cascades the stop to the stream and the state observers clean up
+  /// when `.stopped` arrives.
+  func endSession() {
+    guard let session = deviceSession else { return }
+    // Reflect the in-flight stop immediately so the controls disable at once; the
+    // state observer drives it onward to `.stopped`.
+    sessionState = .stopping
+    session.stop()
+  }
 
-  var body: some View {
-    NavigationStack {
-      ScrollView {
-        VStack(alignment: .leading, spacing: 16) {
-          Text(client.statusText)
-            .font(.system(size: 18, weight: .semibold))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding()
-            .background(Color.secondary.opacity(0.15))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+  // MARK: - Lifecycle step 2: stream
 
-          if !client.heardText.isEmpty {
-            Text("听到：\(client.heardText)")
-              .font(.system(size: 14))
-              .foregroundStyle(.secondary)
-          }
+  /// Adds a `Stream` to the started session and starts it. Requires a session in
+  /// `.started`. Camera permission is checked first (a query, no redirect); if it
+  /// isn't already granted, the actual request — which redirects to the Meta AI
+  /// app — is deferred to `confirmCameraPermissionRedirect()` so the app-switch is
+  /// confirmed, not a surprise.
+  func startStreaming() async {
+    guard let session = deviceSession, session.state == .started else {
+      showError("Start a session before previewing.")
+      return
+    }
+    guard camera == nil else { return }
 
-          if let pending = client.pendingMove {
-            VStack(spacing: 10) {
-              Text("确认发送「\(pending.label)」？")
-                .font(.system(size: 17, weight: .semibold))
-              HStack(spacing: 12) {
-                Button {
-                  client.confirmSend()
-                } label: {
-                  Text("确认发送").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                Button(role: .destructive) {
-                  client.cancelPending()
-                } label: {
-                  Text("取消").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-              }
-            }
-            .padding()
-            .background(Color.orange.opacity(0.15))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-          }
-
-          Button {
-            client.toggleListening()
-          } label: {
-            Text(client.isListening ? "停止聆听" : "开始听口令")
-              .font(.system(size: 17, weight: .semibold))
-              .frame(maxWidth: .infinity)
-              .frame(height: 50)
-          }
-          .buttonStyle(.borderedProminent)
-          .tint(client.isListening ? .red : .blue)
-          .disabled(client.pendingMove != nil)
-
-          VStack(alignment: .leading, spacing: 6) {
-            Text("可说口令").font(.headline)
-            ForEach(ArmCommandClient.moves) { move in
-              HStack {
-                Text(move.label)
-                Spacer()
-                Text(move.key).monospaced().foregroundStyle(.secondary)
-              }
-              .font(.system(size: 15))
-            }
-          }
-
-          if !client.logLines.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-              Text("记录").font(.headline)
-              ForEach(Array(client.logLines.enumerated()), id: \.offset) { _, line in
-                Text(line)
-                  .font(.system(size: 12))
-                  .monospaced()
-                  .foregroundStyle(.secondary)
-              }
-            }
-          }
-        }
-        .padding()
+    do {
+      if try await wearables.checkPermissionStatus(.camera) == .granted {
+        beginStream(on: session)
+      } else {
+        showCameraPermissionRedirectConfirm = true
       }
-      .navigationTitle("机械臂口令")
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .topBarTrailing) {
-          Button("关闭") {
-            client.stopAll()
-            dismiss()
-          }
+    } catch {
+      showError(error.localizedDescription)
+    }
+  }
+
+  /// Confirmed from the permission prompt: requests camera access — this opens the
+  /// Meta AI app and resumes when the user returns — then starts the stream if
+  /// access was granted.
+  func confirmCameraPermissionRedirect() async {
+    showCameraPermissionRedirectConfirm = false
+    guard let session = deviceSession, session.state == .started, camera == nil else { return }
+    do {
+      guard try await wearables.requestPermission(.camera) == .granted else {
+        showError("Camera permission denied")
+        return
+      }
+    } catch {
+      showError(error.localizedDescription)
+      return
+    }
+    beginStream(on: session)
+  }
+
+  /// Uploads one decoded frame to the Pi receiver (see piFrameURL) and a
+  /// second copy to the Yahboom arm's FPV receiver (see armFrameURL).
+  /// Fire-and-forget: failures are ignored so streaming never stalls.
+  private func uploadFrameToPi(_ image: UIImage) {
+    guard let jpeg = image.jpegData(compressionQuality: 0.7) else { return }
+    // Arm copy first: pure fire-and-forget, response ignored, so it can
+    // never trigger or block the face announcement from the Pi below.
+    var armReq = URLRequest(url: armFrameURL)
+    armReq.httpMethod = "POST"
+    armReq.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+    armReq.httpBody = jpeg
+    URLSession.shared.dataTask(with: armReq) { _, _, _ in }.resume()
+    var req = URLRequest(url: piFrameURL)
+    req.httpMethod = "POST"
+    req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+    req.httpBody = jpeg
+    URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+      // The Pi recognizes inline and returns {"faces":[{name, match_score}]}
+      // in the POST response. Announce a recognized name (debounced);
+      // unregistered faces (name == null) are never announced.
+      guard let self, let data,
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let faces = obj["faces"] as? [[String: Any]],
+            let first = faces.first,
+            let name = first["name"] as? String else { return }
+      Task { @MainActor in
+        let now = Date()
+        if self.lastAnnouncedName != name
+            || now.timeIntervalSince(self.lastAnnounceTime) > 10 {
+          self.lastAnnouncedName = name
+          self.lastAnnounceTime = now
+          let utt = AVSpeechUtterance(string: "认出\(name)")
+          utt.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+          self.piSpeech.speak(utt)
         }
       }
-      .onDisappear {
-        client.stopAll()
+    }.resume()
+  }
+
+  /// Creates the camera `Stream` on the started session and starts it. Callers
+  /// must have ensured camera permission is granted first.
+  private func beginStream(on session: DeviceSession) {
+    guard camera == nil else { return }
+    // hvc1 (compressed HEVC) so frames can be written to file in passthrough mode.
+    // Glasses-mic (Bluetooth HFP) audio for sound-in-video is captured app-side by
+    // AudioCaptureHandler, so the SDK stream needs only the public video config (no audio codec).
+    let config = StreamConfiguration(
+      videoCodec: VideoCodec.hvc1,
+      resolution: StreamingResolution.high,
+      frameRate: 24
+    )
+
+    do {
+      // Add the consolidated `Camera` capability and stream through `camera.stream`.
+      guard let newCamera = try session.addCamera(config: config) else {
+        showError("Couldn't create the camera. Try again.")
+        return
+      }
+      camera = newCamera
+      // Subscribe before start() so no initial state transitions are missed.
+      setupStreamListeners(for: newCamera.stream)
+      // Reflect the in-flight request immediately; the observer drives it onward.
+      streamState = .starting
+      newCamera.stream.start()
+    } catch {
+      camera = nil
+      showError(error.localizedDescription)
+    }
+  }
+
+  /// Stops the camera stream but keeps the `DeviceSession` connected, so
+  /// streaming can be started again without re-creating the session. The stream
+  /// `.stopped` observer performs the teardown — we don't eagerly reset here.
+  func stopStreaming() {
+    guard let activeCamera = camera else { return }
+    videoRecorder.prepareToStop()
+    // Reflect the in-flight request immediately; the observer drives it onward.
+    streamState = .stopping
+    // Stopping the camera cascades to its stream child and detaches the camera from the
+    // session, so streaming can be started again with a fresh `addCamera()`.
+    activeCamera.stop()
+  }
+
+  // MARK: - Capture
+
+  func capturePhoto() {
+    guard !isCapturingPhoto, isStreaming else {
+      showError(photoCaptureFailureMessage)
+      return
+    }
+    isCapturingPhoto = true
+    let success = camera?.stream.capturePhoto(format: .jpeg) ?? false
+    if !success {
+      isCapturingPhoto = false
+      showError(photoCaptureFailureMessage)
+    }
+  }
+
+  func toggleRecording() {
+    if isRecording {
+      Task { await stopVideoRecording() }
+    } else {
+      startVideoRecording()
+    }
+  }
+
+  func startVideoRecording() {
+    guard isStreaming, !isRecording else { return }
+    // Flip the intent flag synchronously so the toggle and UI don't lag the
+    // frame-driven recorder; the file starts on the next frame.
+    isRecording = true
+    // If the glasses mic isn't available, flip the mic off so the button reflects that this
+    // recording is video-only (the phone mic is never used). Left off afterward — the user can
+    // re-tap the mic to turn it back on.
+    videoRecorder.prepareToStart(includeAudio: includeAudioInStream) { [weak self] in
+      Task { @MainActor in self?.includeAudioInStream = false }
+    }
+  }
+
+  func stopVideoRecording() async {
+    guard isRecording else { return }
+    isRecording = false
+    recordingStartDate = nil
+    // The writer starts on the first frame after the shutter opens. If stop lands
+    // before that frame arrives, wait briefly (shutter still open) so even a quick
+    // recording finalizes to a file and reliably opens the preview.
+    var elapsedNanos: UInt64 = 0
+    while !videoRecorder.isRecording, elapsedNanos < 500_000_000 {
+      try? await Task.sleep(nanoseconds: 25_000_000)
+      elapsedNanos += 25_000_000
+    }
+    // Show a preview/share sheet (mirrors the photo flow) for the finalized file.
+    switch await videoRecorder.stopRecording() {
+    case .completed(let url):
+      activePreview = .video(url)
+    case .noRecording:
+      // Reached only after the intent guard + start wait, so while streaming this
+      // means the recording never started (e.g. the writer failed to start).
+      showError("Couldn't start recording. Try again.")
+    case .failed:
+      showError("Recording couldn't be saved. Try again.")
+    }
+  }
+
+  // MARK: - Dismissers
+
+  func dismissError() {
+    showError = false
+  }
+
+  func dismissCapturePreview() {
+    guard let preview = activePreview else { return }
+    activePreview = nil
+    discardPreview(preview)
+  }
+
+  /// Deletes a finished video capture's temporary file. Photos are held in
+  /// memory, so there's nothing on disk to remove for them.
+  func discardPreview(_ preview: CapturePreview) {
+    if case .video(let url) = preview {
+      try? FileManager.default.removeItem(at: url)
+    }
+  }
+
+  // MARK: - Device monitoring
+
+  /// Monitors device availability only — does NOT create sessions. Session
+  /// creation is deferred to `startSession()` to avoid races.
+  private func startDeviceMonitoring() {
+    deviceMonitorTask = Task { [weak self] in
+      guard let self else { return }
+      for await deviceId in deviceSelector.activeDeviceStream() {
+        hasActiveDevice = deviceId != nil
       }
     }
+  }
+
+  private func startAppLifecycleMonitoring() {
+    appLifecycleTask = Task { [weak self] in
+      guard let self else { return }
+      for await _ in NotificationCenter.default.notifications(named: UIApplication.didEnterBackgroundNotification) {
+        self.handleDidEnterBackground()
+      }
+    }
+  }
+
+  private func handleDidEnterBackground() {
+    guard hasSession, hasStream, sessionState != .stopping else { return }
+
+    beginBackgroundStopErrorSuppression()
+    endSession()
+  }
+
+  private func beginBackgroundStopErrorSuppression() {
+    isStoppingForBackground = true
+    backgroundStopSuppressionTask?.cancel()
+    let timeout = backgroundStopErrorSuppressionTimeout
+    backgroundStopSuppressionTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(for: timeout)
+      guard let self, !Task.isCancelled else { return }
+      // Bound the suppression window so a stalled teardown cannot hide
+      // unrelated later errors indefinitely.
+      self.isStoppingForBackground = false
+      self.backgroundStopSuppressionTask = nil
+    }
+  }
+
+  private func endBackgroundStopErrorSuppression() {
+    backgroundStopSuppressionTask?.cancel()
+    backgroundStopSuppressionTask = nil
+    isStoppingForBackground = false
+  }
+
+  // MARK: - Session observation
+
+  private func observeSession(_ session: DeviceSession) {
+    session.statePublisher.listen { [weak self] state in
+      Task { @MainActor in self?.handleSessionStateChange(state) }
+    }.store(in: sessionTokenBag)
+    session.errorPublisher.listen { [weak self] error in
+      Task { @MainActor in self?.handleSessionError(error) }
+    }.store(in: sessionTokenBag)
+  }
+
+  private func handleSessionStateChange(_ state: DeviceSessionState) {
+    sessionState = state
+    if state == .stopped {
+      endBackgroundStopErrorSuppression()
+      cleanupSession()
+    }
+  }
+
+  private func handleSessionError(_ error: DeviceSessionError) {
+    // Backgrounding the app intentionally ends the preview session; the SDK can
+    // still emit teardown errors while that stop converges, and surfacing those
+    // would show a false "something went wrong" alert on return.
+    guard !isStoppingForBackground else { return }
+    // All session errors surface through the single alert, including
+    // `datAppOnTheGlassesUpdateRequired`, which the SDK delivers as a one-shot event.
+    showError(error.localizedDescription)
+  }
+
+  /// Terminal session cleanup — drop the reference and observers so the next
+  /// `startSession()` creates a fresh session.
+  private func cleanupSession() {
+    sessionTokenBag.clear()
+    deviceSession = nil
+  }
+
+  // MARK: - Stream observation
+
+  private func setupStreamListeners(for stream: MWDATCamera.Stream) {
+    stream.statePublisher.listen { [weak self] state in
+      Task { @MainActor in self?.handleStreamStateChange(state) }
+    }.store(in: streamTokenBag)
+
+    stream.videoFramePublisher.listen { [weak self] frame in
+      guard let self else { return }
+
+      // Append to the recorder (no-op unless recording) off the main actor so it
+      // keeps writing while the app is backgrounded.
+      self.appendVideoFrame(frame)
+
+      // Decode the compressed hvc1 frame for preview off the main actor.
+      let previewImage = self.videoFrameDecoder.decode(frame.sampleBuffer)
+
+      // Upload ~1 fps to the Pi for face recognition (fire-and-forget).
+      // The frame publisher's closure is Sendable, so this MainActor
+      // class's state is touched via a MainActor task, the same pattern
+      // used elsewhere in this file.
+      if let image = previewImage {
+        Task { @MainActor in
+          if Date().timeIntervalSince(self.lastPiUpload) >= 1.0 {
+            self.lastPiUpload = Date()
+            self.uploadFrameToPi(image)
+          }
+        }
+      }
+
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        // Keep the live surface stable while a capture preview is onscreen.
+        if UIApplication.shared.applicationState != .background,
+          activePreview == nil,
+          !isCapturingPhoto,
+          let image = previewImage
+        {
+          self.currentVideoFrame = image
+          if !self.hasReceivedFirstFrame {
+            self.hasReceivedFirstFrame = true
+          }
+        }
+        // Capture the actual recording start (first written frame) once, so the timer
+        // anchors to the clip's start and matches its duration.
+        if self.isRecording, self.recordingStartDate == nil {
+          self.recordingStartDate = self.videoRecorder.recordingStartDate
+        }
+      }
+    }.store(in: streamTokenBag)
+
+    stream.errorPublisher.listen { [weak self] error in
+      Task { @MainActor in self?.handleStreamError(error) }
+    }.store(in: streamTokenBag)
+
+    stream.photoDataPublisher.listen { [weak self] data in
+      Task { @MainActor in self?.handlePhotoData(data) }
+    }.store(in: streamTokenBag)
+  }
+
+  private func handleStreamStateChange(_ state: StreamState) {
+    streamState = state
+    if state == .stopped {
+      // Terminal — finalize any recording, then converge teardown. Covers both
+      // user-initiated stop and SDK auto-stop (disconnect, error, session end).
+      Task { await stopVideoRecording() }
+      clearStreamResources()
+    }
+  }
+
+  /// Single stream-teardown convergence point.
+  private func clearStreamResources() {
+    streamTokenBag.clear()
+    // Detach the camera (idempotent) so a subsequent addCamera() can register a new one. On the
+    // user-stop and session-end paths the camera is already stopped, so this is a no-op; it is
+    // load-bearing only when the stream terminates on its own (a stream-level error while the
+    // session stays connected), since teardown cascades parent->child but not child->parent.
+    camera?.stop()
+    camera = nil
+    streamState = .stopped
+    currentVideoFrame = nil
+    hasReceivedFirstFrame = false
+  }
+
+  /// Appends a frame to the recorder. `nonisolated` so it keeps writing while the
+  /// app is backgrounded (the recorder is thread-safe).
+  nonisolated private func appendVideoFrame(_ frame: VideoFrame) {
+    videoRecorder.appendVideoFrame(frame.sampleBuffer)
+  }
+
+  private func handleStreamError(_ error: StreamError) {
+    // Same bounded suppression window as `handleSessionError`: hide only the
+    // expected teardown noise from an intentional background-driven stop.
+    guard !isStoppingForBackground else { return }
+    showError(error.localizedDescription)
+  }
+
+  private func handlePhotoData(_ data: PhotoData) {
+    isCapturingPhoto = false
+    if let image = UIImage(data: data.data) {
+      activePreview = .photo(image)
+    }
+  }
+
+  private func showError(_ message: String) {
+    errorMessage = message
+    showError = true
   }
 }
