@@ -998,31 +998,55 @@ final class SpeechDiagClient {
   }
 
   // Stage 1: speech recognition authorization only.
+  // The request goes through a nonisolated async helper on purpose: a
+  // completion closure formed inside this @MainActor class inherits
+  // MainActor isolation, TCC delivers the reply on a background XPC queue,
+  // and the Swift executor check on closure entry traps (SIGTRAP - the
+  // crash localized by the 2026-11-03 diagnostic build, see thread with
+  // dispatch_assert_queue under SpeechDiagClient.stage1Auth).
   func stage1Auth() {
     mark("1-语音授权-开始")
     authText = "请求中…"
-    SFSpeechRecognizer.requestAuthorization { status in
-      Task { @MainActor in
-        self.mark("1-语音授权-完成")
-        switch status {
-        case .authorized: self.authText = "已授权"
-        case .denied: self.authText = "被拒绝"
-        case .restricted: self.authText = "受限制（系统/家长控制）"
-        case .notDetermined: self.authText = "未决定"
-        @unknown default: self.authText = "未知状态"
-        }
+    Task { @MainActor in
+      let status = await Self.requestSpeechAuthorizationAsync()
+      mark("1-语音授权-完成")
+      switch status {
+      case .authorized: authText = "已授权"
+      case .denied: authText = "被拒绝"
+      case .restricted: authText = "受限制（系统/家长控制）"
+      case .notDetermined: authText = "未决定"
+      @unknown default: authText = "未知状态"
       }
     }
   }
 
-  // Stage 2: microphone record permission only.
+  nonisolated private static func requestSpeechAuthorizationAsync() async
+    -> SFSpeechRecognizerAuthorizationStatus
+  {
+    await withCheckedContinuation { continuation in
+      SFSpeechRecognizer.requestAuthorization { status in
+        continuation.resume(returning: status)
+      }
+    }
+  }
+
+  // Stage 2: microphone record permission only. Same nonisolated-helper
+  // pattern as stage 1 - the record-permission reply also arrives off the
+  // main queue.
   func stage2Mic() {
     mark("2-麦克风授权-开始")
     micText = "请求中…"
-    AVAudioApplication.requestRecordPermission { granted in
-      Task { @MainActor in
-        self.mark("2-麦克风授权-完成")
-        self.micText = granted ? "已允许" : "被拒绝"
+    Task { @MainActor in
+      let granted = await Self.requestRecordPermissionAsync()
+      mark("2-麦克风授权-完成")
+      micText = granted ? "已允许" : "被拒绝"
+    }
+  }
+
+  nonisolated private static func requestRecordPermissionAsync() async -> Bool {
+    await withCheckedContinuation { continuation in
+      AVAudioApplication.requestRecordPermission { granted in
+        continuation.resume(returning: granted)
       }
     }
   }
@@ -1108,20 +1132,37 @@ final class SpeechDiagClient {
     request.shouldReportPartialResults = true
     request.contextualStrings = ArmCommandClient.moves.flatMap(\.phrases) + ["确认", "取消"]
     mark("6-识别任务-启动")
-    task = recognizer.recognitionTask(with: request) { result, error in
-      let text = result?.bestTranscription.formattedString
+    task = Self.startRecognitionTask(
+      recognizer: recognizer, request: request
+    ) { [weak self] text, isFinal, errorText in
       Task { @MainActor in
+        guard let self else { return }
         if let text {
-          self.transcriptText = text
+          transcriptText = text
         }
-        if let error {
-          self.taskText = "任务出错：\(error.localizedDescription)"
-        } else if result?.isFinal ?? false {
-          self.taskText = "任务结束（final）"
+        if let errorText {
+          taskText = "任务出错：\(errorText)"
+        } else if isFinal {
+          taskText = "任务结束（final）"
         }
       }
     }
     mark("6-识别任务-运行中")
+  }
+
+  // Nonisolated: the recognition result handler must not inherit MainActor
+  // isolation either - the Speech daemon calls it back on its own queue.
+  nonisolated private static func startRecognitionTask(
+    recognizer: SFSpeechRecognizer,
+    request: SFSpeechAudioBufferRecognitionRequest,
+    onEvent: @escaping @Sendable (_ text: String?, _ isFinal: Bool, _ errorText: String?) -> Void
+  ) -> SFSpeechRecognitionTask {
+    recognizer.recognitionTask(with: request) { result, error in
+      onEvent(
+        result?.bestTranscription.formattedString,
+        result?.isFinal ?? false,
+        error?.localizedDescription)
+    }
   }
 
   func stopAll() {
