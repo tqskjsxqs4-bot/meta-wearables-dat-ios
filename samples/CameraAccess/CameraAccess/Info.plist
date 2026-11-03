@@ -67,8 +67,6 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This lets your phone find and connect to your glasses over Wi-Fi.</string>
 	<key>NSBonjourServices</key>
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>Used to recognize spoken chess-move commands for the robot arm.</string>
 	<array>
 		<string>_bonjour._tcp</string>
 	</array>
@@ -81,6 +79,8 @@
 	<string>This app needs camera access to stream from your phone's camera as a mock device feed.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app needs microphone access to record sound from your glasses' microphone alongside video.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Used to recognize spoken chess-move commands for the robot arm.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
